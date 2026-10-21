@@ -7,7 +7,7 @@
 ```bash
 make up      # 起 ClickHouse 24.8、Redis 7、API 三个容器（需要 Docker）
 make seed    # 建表 → 导入 xlsx → 去重与质量校验 → 品类识别 → 汇总重算
-make demo    # 8 条典型请求与真实响应
+make demo    # 10 条典型请求与真实响应
 ```
 
 然后打开 <http://localhost:8000/docs> 交互式调用。其他命令：
@@ -27,10 +27,11 @@ make demo    # 8 条典型请求与真实响应
 | maxi dress 命中商品 | 2001–2012，共 12 个 |
 | 总销量（UTC） | **1117**：app 368 · marketplace 372 · website 377 |
 | 分月（UTC） | 1 月 484 · 2 月 445 · 3 月 188 |
-| 2 月合计，按 Asia/Shanghai 出报表 | 415（跨月探针行换日） |
+| 分月日均（UTC） | 15.6 · 15.3 · 14.5（3 月只覆盖 1–13 号，`partial: true`；合计 188 不是「崩了」） |
+| 2 月合计，按 Asia/Shanghai 出报表 | **取决于源时区**：源时间若是 UTC，为 415（跨月探针行换日）；源时间若本来就是北京时间，为 445，与原样切日相同。源时区尚未确认，所以这个请求会带 `SOURCE_TZ_UNCONFIRMED` 警告 |
 | 原始 300 行 | 12 行整行重复，fact 288 行 |
 | 边界商品 | Maxi Skirt 排除 · Elegant Long Dress 待审不计入 · T-shirt Dress 类目冲突告警 |
-| 数据截止 | 2024-03-13 09:45 UTC，之后的日期返回 `null` 而不是 `0` |
+| 数据截止 | 按平台推断：app 03-13 09:45Z · website 03-12 18:05Z · marketplace 03-11 15:15Z；各平台截止之后返回 `null` 而不是 `0` |
 
 这些数字全部写在 [`tests/golden/expected.json`](tests/golden/expected.json)，集成测试经 API 全链路逐条断言。
 
@@ -85,16 +86,20 @@ GET /v1/product-classes/{class_slug}/sales-trend
   "data": {
     "dates":  ["2024-01-01", "2024-01-02", "2024-01-03", "…", "2024-03-31"],
     "series": [
-      {"platform": "app",         "values": [10, 13, 0, "…", null]},
-      {"platform": "marketplace", "values": [0,  0,  7, "…", null]},
-      {"platform": "website",     "values": [19, 0,  0, "…", null]}
+      {"platform": "app",         "values": [10, 13, 0, "…", 0,    0,    null]},
+      {"platform": "marketplace", "values": [0,  0,  7, "…", null, null, null]},
+      {"platform": "website",     "values": [19, 0,  0, "…", 6,    null, null]}
     ],
-    "total": [29, 13, 7, "…", null]
+    "total": [29, 13, 7, "…", 6, 0, null]
   },
   "meta": {
     "tz": "UTC", "rule_version": "v1", "granularity": "day",
     "data_through": "2024-03-13T09:45:00Z",
-    "partial_dates": ["2024-03-13"],
+    "data_through_by_platform": {"app": "2024-03-13T09:45:00Z", "marketplace": "2024-03-11T15:15:00Z",
+                                 "website": "2024-03-12T18:05:00Z"},
+    "partial_dates": ["2024-03-11", "2024-03-12", "2024-03-13"],
+    "source_tz_assumed": true,
+    "warnings": [],
     "sum": {"app": 368, "marketplace": 372, "website": 377, "all": 1117},
     "plan": [
       {"segment": "class_daily", "table": "agg_class_daily", "from": "2024-01-01", "to": "2024-03-12"},
@@ -105,6 +110,32 @@ GET /v1/product-classes/{class_slug}/sales-trend
 }
 ```
 
+上例省略号后三列是 03-12、03-13、03-31。字段口径：
+
+| 字段 | 含义 |
+|---|---|
+| `values` 里的 `0` / `null` | `0` = 没卖出去；`null` = 晚于**该平台**的数据截止，还不知道 |
+| `total` | 选中平台全部为 null → null；部分为 null → 非 null 平台之和，并把这一天记入 `partial_dates` |
+| `meta.data_through_by_platform` | 各平台截止时间，**从该平台最新事件推断**。生产应换成采集侧心跳与接收水位：平台某天真的零销量时，推断值会把它误判成 null |
+| `meta.partial_dates` | 不完整的本地日：含某个平台的截止时刻，或部分平台已为 null |
+| `meta.source_tz_assumed` | 选中平台里有源时区**未与采集方确认**的（样例三个平台都是） |
+| `meta.warnings` | 不影响返回的提示，没有时为 `[]`。请求 `tz` 与未确认的源时区不同时带 `{"code": "SOURCE_TZ_UNCONFIRMED", "message", "platforms", "source_tz"}`：换算可能引入整体偏移 |
+
+`granularity=week|month` 时，`data` 下再加四个与 `dates` 平行的数组（仍是列式；`day` 粒度不带）：
+
+| 字段 | 含义 |
+|---|---|
+| `days_in_bucket` | 桶本身的天数：周 7，月 28–31，不受查询区间裁剪 |
+| `days_covered` | 桶内落在查询区间、且不晚于数据截止的天数。「数据截止」取选中平台里最晚的一个；截止当天虽不完整，也算一整天 |
+| `partial` | `days_covered < days_in_bucket`，或桶内含 `partial_dates` 里的日 |
+| `daily_avg` | `total / days_covered`，保留一位小数；`days_covered` 为 0 时为 null。只给 total 的日均，不给按平台的日均：各平台截止不同，按平台日均要用各自的覆盖天数（例如 marketplace 3 月只有 11 天），需要时用 `data_through_by_platform` 自行折算 |
+
+```json
+"data": {"dates": ["2024-01-01", "2024-02-01", "2024-03-01"], "total": [484, 445, 188],
+         "days_in_bucket": [31, 29, 31], "days_covered": [31, 29, 13],
+         "partial": [false, false, true], "daily_avg": [15.6, 15.3, 14.5], "series": ["…"]}
+```
+
 错误体遵循 RFC 9457（`application/problem+json`），11 个错误码，每个都有测试：
 
 ```json
@@ -113,13 +144,13 @@ GET /v1/product-classes/{class_slug}/sales-trend
  "invalid_params": [{"name": "tz", "reason": "'+08:00' is not an IANA time zone name, e.g. Asia/Shanghai"}]}
 ```
 
-完整定义见 [docs/openapi.json](docs/openapi.json)；`make demo` 打印 8 条真实请求与响应。
+完整定义见 [docs/openapi.json](docs/openapi.json)（`TrendResponse` schema 带逐字段说明）；`make demo` 打印 10 条真实请求与响应。
 
 ## 交付物对照
 
 | 题面要求 | 位置 |
 |---|---|
-| maxi dress 识别 / 归一化规则 | [rules/maxi_dress.v1.yaml](rules/maxi_dress.v1.yaml) · [design.md §3.3](docs/design.md) |
+| maxi dress 识别 / 归一化规则 | [rules/maxi_dress.v1.yaml](rules/maxi_dress.v1.yaml) · [design.md §3.3](docs/design.md) · v3 影子版本（中心词 + 长度槽分档，32 条对抗用例）见 [docs/classification-v3.md](docs/classification-v3.md) |
 | 存储方案、schema、索引 | [sql/ddl/001_tables.sql](sql/ddl/001_tables.sql) · [design.md §1–2](docs/design.md) · ES 等价方案 [es/](es/README.md) |
 | 核心查询（按日期、平台分组） | [sql/queries/](sql/queries/) 三段 · [sql/rollup/](sql/rollup/) 汇总重算 |
 | RESTful API 与错误处理 | [src/salestrend/api/](src/salestrend/api/) · [docs/openapi.json](docs/openapi.json) |
@@ -144,8 +175,8 @@ tests/integration          真 ClickHouse 黄金值、三条路径对拍、重�
 
 ## 已知局限与下一步
 
-- **时区假设**：三个平台默认按 UTC 解析。小时分布更像本地营业时间，生产须与采集方确认后改 `config/platforms.yaml` 并重放。
-- **各平台截止时间不同**：marketplace 最新事件在 03-11，当前按全局截止时间判 null，所以它在 03-12、03-13 显示 0。生产应由采集侧上报各平台的接收水位，按平台判 null。
+- **源时区未确认**：三个平台暂按 UTC 解析（`config/platforms.yaml` 里 `confirmed: false`），等于按时间戳上写的日期原样切日。请求别的 `tz` 时响应带 `SOURCE_TZ_UNCONFIRMED` 警告，不拒绝。确认后改配置并重放；采集契约应要求时间戳带偏移量（见 [design.md §3.1](docs/design.md)）。
+- **各平台截止时间是推断的**：已按各平台自己的截止时间判 null（marketplace 03-12 起、website 03-13 起为 null），但截止时间取自该平台最新事件。平台某天真的零销量时会被误判成 null；生产要靠采集侧心跳与接收水位。
 - **大数据量没有实测**：样例只有 300 行。千万级合成数据下的一年区间小时表查询（压测 P5）这次没有做，设计里的容量与 SLO 是推算值。
 - **singleflight 与限流是进程内的**：多实例部署时，singleflight 锁与令牌桶应放到 Redis 或网关。
 - **重算任务没有接调度器**：演示用 `make seed` 一次性重算；生产按「每 5 分钟最近 3 小时、每天最近 2 天」接 cron 或调度系统。

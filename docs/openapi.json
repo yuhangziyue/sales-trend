@@ -250,10 +250,12 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "列式趋势。week / month 额外带 days_in_bucket、days_covered、partial、daily_avg 四个平行数组；day 粒度不带",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/TrendResponse"
+                }
               }
             }
           },
@@ -285,6 +287,330 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "Series": {
+        "properties": {
+          "platform": {
+            "type": "string",
+            "title": "Platform"
+          },
+          "values": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Values",
+            "description": "与 dates 一一对应。0 = 没卖出去；null = 晚于该平台的数据截止"
+          }
+        },
+        "type": "object",
+        "required": [
+          "platform",
+          "values"
+        ],
+        "title": "Series"
+      },
+      "SourceTzWarning": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "SOURCE_TZ_UNCONFIRMED"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "platforms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Platforms",
+            "description": "源时区未确认、且与请求 tz 不同的平台"
+          },
+          "source_tz": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Source Tz",
+            "description": "这些平台当前假设的源时区"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "platforms",
+          "source_tz"
+        ],
+        "title": "SourceTzWarning"
+      },
+      "TrendData": {
+        "properties": {
+          "dates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Dates",
+            "description": "桶的起始本地日期；首个周/月桶从 start_date 起算"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/Series"
+            },
+            "type": "array",
+            "title": "Series"
+          },
+          "total": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Total",
+            "description": "选中平台之和。全部平台为 null 时为 null；部分为 null 时 = 非 null 平台之和，并记入 partial_dates"
+          },
+          "days_in_bucket": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Days In Bucket",
+            "description": "仅 week / month：桶本身的天数（周 7，月 28–31），不受查询区间裁剪"
+          },
+          "days_covered": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Days Covered",
+            "description": "仅 week / month：桶内落在查询区间、且不晚于数据截止的天数（截止当天算一整天）"
+          },
+          "partial": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "boolean"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partial",
+            "description": "仅 week / month：days_covered < days_in_bucket，或桶内含 partial_dates 中的日"
+          },
+          "daily_avg": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Avg",
+            "description": "仅 week / month：total / days_covered，保留一位小数；days_covered 为 0 时为 null。只给 total 的日均，不给按平台的日均"
+          }
+        },
+        "type": "object",
+        "required": [
+          "dates",
+          "series",
+          "total"
+        ],
+        "title": "TrendData"
+      },
+      "TrendMeta": {
+        "properties": {
+          "class_slug": {
+            "type": "string",
+            "title": "Class Slug"
+          },
+          "rule_version": {
+            "type": "string",
+            "title": "Rule Version"
+          },
+          "tz": {
+            "type": "string",
+            "title": "Tz"
+          },
+          "granularity": {
+            "type": "string",
+            "title": "Granularity"
+          },
+          "start_date": {
+            "type": "string",
+            "title": "Start Date"
+          },
+          "end_date": {
+            "type": "string",
+            "title": "End Date"
+          },
+          "platforms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Platforms"
+          },
+          "data_through": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Through",
+            "description": "全部平台中最新的事件时间（UTC）"
+          },
+          "data_through_by_platform": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Data Through By Platform",
+            "description": "选中平台各自的截止时间（UTC），从该平台最新事件推断；生产应换成采集侧心跳与接收水位"
+          },
+          "partial_dates": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Partial Dates",
+            "description": "不完整的本地日：含某平台截止时刻，或部分平台已为 null"
+          },
+          "source_tz_assumed": {
+            "type": "boolean",
+            "title": "Source Tz Assumed",
+            "description": "选中平台里有源时区未与采集方确认的平台"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/SourceTzWarning"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "description": "不影响结果返回的提示；没有时为空数组"
+          },
+          "sum": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Sum",
+            "description": "区间合计，按平台与 all；null 按 0 计"
+          },
+          "plan": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Plan",
+            "description": "查询规划：每段读的表与日期范围"
+          },
+          "cache": {
+            "type": "string",
+            "title": "Cache",
+            "description": "hit | miss | stale"
+          },
+          "stale": {
+            "type": "boolean",
+            "title": "Stale"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "class_slug",
+          "rule_version",
+          "tz",
+          "granularity",
+          "start_date",
+          "end_date",
+          "platforms",
+          "data_through",
+          "data_through_by_platform",
+          "partial_dates",
+          "source_tz_assumed",
+          "warnings",
+          "sum",
+          "plan",
+          "cache",
+          "stale",
+          "generated_at"
+        ],
+        "title": "TrendMeta"
+      },
+      "TrendResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TrendData"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/TrendMeta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "title": "TrendResponse"
       },
       "ValidationError": {
         "properties": {

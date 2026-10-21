@@ -62,3 +62,40 @@ def test_force_segment_for_cross_check():
     p = plan_query(date(2024, 1, 1), date(2024, 1, 31), "UTC", sealed_until=SEALED, data_through=THROUGH,
                    preset_timezones=PRESET, force="fact")
     assert kinds(p) == [("fact", "2024-01-01", "2024-01-31")]
+
+
+# ---------- 按平台截止 ----------
+BY_SRC = {"app": THROUGH, "marketplace": datetime(2024, 3, 11, 15, 15, tzinfo=UTC),
+          "website": datetime(2024, 3, 12, 18, 5, tzinfo=UTC)}
+
+
+def test_platform_cutoffs_null_and_partial():
+    p = plan_query(date(2024, 3, 10), date(2024, 3, 15), "UTC", sealed_until=SEALED, data_through=THROUGH,
+                   preset_timezones=PRESET, platform_through=BY_SRC)
+    assert p.null_by_platform["marketplace"] == {date(2024, 3, d) for d in range(12, 16)}
+    assert p.null_by_platform["website"] == {date(2024, 3, d) for d in range(13, 16)}
+    assert p.null_dates == {date(2024, 3, 14), date(2024, 3, 15)}  # 全部平台都没数据才不查库
+    # 03-11 marketplace 截止日；03-12 website 截止日且 marketplace 已 null；03-13 app 截止日
+    assert p.partial_dates == {date(2024, 3, 11), date(2024, 3, 12), date(2024, 3, 13)}
+    assert not p.fully_sealed
+
+
+def test_platform_cutoffs_use_latest_selected_platform_for_query_range():
+    p = plan_query(date(2024, 3, 10), date(2024, 3, 15), "UTC", sealed_until=SEALED, data_through=THROUGH,
+                   preset_timezones=PRESET, platform_through={"marketplace": BY_SRC["marketplace"]})
+    assert kinds(p) == [("class_daily", "2024-03-10", "2024-03-11")]  # 只选 marketplace：12 号起不查
+    assert p.partial_dates == {date(2024, 3, 11)}
+
+
+def test_platform_cutoff_follows_report_tz():
+    # website 截止 03-12 18:05Z = 上海 03-13 02:05：按上海切日，website 的 03-13 是不完整日而不是 null
+    p = plan_query(date(2024, 3, 12), date(2024, 3, 14), "Asia/Shanghai", sealed_until=SEALED,
+                   data_through=THROUGH, preset_timezones=PRESET, platform_through=BY_SRC)
+    assert p.null_by_platform["website"] == {date(2024, 3, 14)}
+    assert date(2024, 3, 13) in p.partial_dates
+
+
+def test_sealed_history_without_platform_nulls_stays_long_cached():
+    p = plan_query(date(2024, 1, 1), date(2024, 1, 31), "UTC", sealed_until=SEALED, data_through=THROUGH,
+                   preset_timezones=PRESET, platform_through=BY_SRC)
+    assert p.fully_sealed and not p.partial_dates

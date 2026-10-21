@@ -5,7 +5,26 @@
   "match_ids": [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012],
   "sum_utc": {"app": 368, "marketplace": 372, "website": 377, "all": 1117},
   "by_month_utc": {"2024-01-01": 484, "2024-02-01": 445, "2024-03-01": 188},
+  "by_month_utc_buckets": {
+    "days_in_bucket": [31, 29, 31],
+    "days_covered": [31, 29, 13],
+    "partial": [false, false, true],
+    "daily_avg": [15.6, 15.3, 14.5]
+  },
   "first_three_days_utc": {"app": [10, 13, 0], "marketplace": [0, 0, 7], "website": [19, 0, 0]},
-  "feb_total_shanghai": 415,
+  "_tail_note": "各平台按自己的最新事件推断截止：marketplace 03-11 15:15Z、website 03-12 18:05Z、app 03-13 09:45Z",
+  "data_through_by_platform": {"app": "2024-03-13T09:45:00Z", "marketplace": "2024-03-11T15:15:00Z",
+                               "website": "2024-03-12T18:05:00Z"},
+  "tail_days_utc": {
+    "dates": ["2024-03-10", "2024-03-11", "2024-03-12", "2024-03-13", "2024-03-14"],
+    "app": [18, 0, 0, 0, null],
+    "marketplace": [0, 4, null, null, null],
+    "website": [0, 0, 6, null, null],
+    "total": [18, 4, 6, 0, null],
+    "partial_dates": ["2024-03-11", "2024-03-12", "2024-03-13"]
+  },
+  "_shanghai_note": "415 只在「源时间是 UTC」的假设下成立；若源时间本来就是北京时间，按北京时间出报表是 445，与原样切日相同",
+  "feb_total_shanghai_if_source_utc": 415,
+  "feb_total_shanghai_if_source_shanghai": 445,
   "elegant_long_dress_sales": 100
 }

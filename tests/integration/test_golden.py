@@ -64,6 +64,12 @@ def test_by_month(api):
     assert dict(zip(r["data"]["dates"], r["data"]["total"], strict=True)) == GOLDEN["by_month_utc"]
 
 
+def test_by_month_daily_avg(api):
+    """3 月按月合计 188 像「崩了」，日均 14.5 与 1、2 月的 15.6、15.3 基本持平。"""
+    d = trend(api, start_date="2024-01-01", end_date="2024-03-31", granularity="month")["data"]
+    assert {k: d[k] for k in GOLDEN["by_month_utc_buckets"]} == GOLDEN["by_month_utc_buckets"]
+
+
 def test_first_three_days(api):
     r = trend(api, start_date="2024-01-01", end_date="2024-01-03")
     got = {s["platform"]: s["values"] for s in r["data"]["series"]}
@@ -71,8 +77,28 @@ def test_first_three_days(api):
 
 
 def test_shanghai_february(api):
+    """源时区按 UTC 假设（未确认）时：按上海出报表 415，并带 SOURCE_TZ_UNCONFIRMED 警告。
+    源时间若本来就是北京时间，结果应是 445，见 test_source_tz.py。"""
     r = trend(api, start_date="2024-02-01", end_date="2024-02-29", tz="Asia/Shanghai")
-    assert r["meta"]["sum"]["all"] == GOLDEN["feb_total_shanghai"]
+    assert r["meta"]["sum"]["all"] == GOLDEN["feb_total_shanghai_if_source_utc"]
+    assert r["meta"]["source_tz_assumed"] is True
+    assert [w["code"] for w in r["meta"]["warnings"]] == ["SOURCE_TZ_UNCONFIRMED"]
+
+
+def test_utc_report_has_no_tz_warning(api):
+    m = trend(api, start_date="2024-02-01", end_date="2024-02-29")["meta"]
+    assert m["source_tz_assumed"] is True and m["warnings"] == []
+
+
+def test_per_platform_cutoff_tail(api):
+    """各类合计不变，只有截止较早的平台在截止之后变成 null（原来是 0）。"""
+    g = GOLDEN["tail_days_utc"]
+    r = trend(api, start_date=g["dates"][0], end_date=g["dates"][-1])
+    got = {s["platform"]: s["values"] for s in r["data"]["series"]}
+    assert got == {k: g[k] for k in ("app", "marketplace", "website")}
+    assert r["data"]["total"] == g["total"]
+    assert r["meta"]["partial_dates"] == g["partial_dates"]
+    assert r["meta"]["data_through_by_platform"] == GOLDEN["data_through_by_platform"]
 
 
 def test_after_data_through_is_null(api):

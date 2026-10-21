@@ -1,0 +1,23 @@
+{
+  "_comment": "PUT _transform/sales_hourly_product —— 连续 transform：明细 → 商品 × 平台 × UTC 小时，对应 ClickHouse 的 agg_product_hourly。sync 用入库时间而不是事件时间，迟到数据才会被重新计入对应小时",
+  "source": {
+    "index": ["sales_events"]
+  },
+  "dest": {
+    "index": "sales_hourly_product"
+  },
+  "frequency": "5m",
+  "sync": {
+    "time": { "field": "ingest_ts", "delay": "60s" }
+  },
+  "pivot": {
+    "group_by": {
+      "product_id": { "terms": { "field": "product_id" } },
+      "source":     { "terms": { "field": "source" } },
+      "hour":       { "date_histogram": { "field": "event_ts", "fixed_interval": "1h" } }
+    },
+    "aggregations": {
+      "sales": { "sum": { "field": "sales_count" } }
+    }
+  }
+}

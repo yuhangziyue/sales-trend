@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -29,6 +30,38 @@ def _bucket(d: date, granularity: str) -> date:
     if granularity == "month":
         return d.replace(day=1)
     return d
+
+
+def _bucket_len(b: date, granularity: str) -> int:
+    return 7 if granularity == "week" else calendar.monthrange(b.year, b.month)[1]
+
+
+_UTC_NAMES = {"UTC", "Etc/UTC", "Etc/UCT", "UCT", "Etc/Zulu", "Zulu", "Universal", "Etc/Universal",
+              "GMT", "Etc/GMT", "Etc/GMT0", "Etc/GMT+0", "Etc/GMT-0", "GMT0", "GMT+0", "GMT-0", "Greenwich"}
+
+
+def _same_tz(a: str, b: str) -> bool:
+    return a == b or (a in _UTC_NAMES and b in _UTC_NAMES)
+
+
+def source_tz_meta(s: Settings, platforms: tuple[str, ...], tz: str) -> tuple[bool, list[dict]]:
+    """源时区没确认时，按别的时区出报表会把「假设错了」放大成整体偏移：不拒绝，但要说出来。
+
+    例：源时间其实是北京时间，却按 UTC 入库，再请求 tz=Asia/Shanghai，每条事件又被往后推 8 小时，
+    样例 2 月合计从 445 变成 415。请求 tz 与源时区相同时，换算是恒等的，假设错不错都不影响切日。
+    """
+    unconfirmed = [src for src in platforms if not s.source_tz_confirmed.get(src, False)]
+    shifted = [src for src in unconfirmed if not _same_tz(s.platforms.get(src, "UTC"), tz)]
+    warnings = []
+    if shifted:
+        warnings.append({
+            "code": "SOURCE_TZ_UNCONFIRMED",
+            "message": (f"source time zone of {', '.join(shifted)} is assumed, not confirmed with the data "
+                        f"provider; converting to {tz} may shift every event by a constant offset"),
+            "platforms": shifted,
+            "source_tz": {src: s.platforms.get(src, "UTC") for src in shifted},
+        })
+    return bool(unconfirmed), warnings
 
 
 class TrendService:
@@ -76,6 +109,7 @@ class TrendService:
         key = p.cache_key(data_gen)
         if self.cache and (hit := await self.cache.get(key)):
             hit["meta"]["cache"] = "hit"
+            self._refresh_tz_meta(hit, p)
             return hit, TTL_SEALED_S if hit["meta"].pop("_sealed", False) else TTL_OPEN_S
 
         try:
@@ -86,19 +120,30 @@ class TrendService:
             ):
                 stale["meta"].pop("_sealed", None)
                 stale["meta"].update(cache="stale", stale=True)
+                self._refresh_tz_meta(stale, p)
                 return stale, 0
             raise
         body = {"data": body["data"], "meta": {**body["meta"]}}
         body["meta"].pop("_sealed", None)
         return body, ttl
 
+    def _refresh_tz_meta(self, body: dict, p: TrendParams) -> None:
+        # 时区警告来自配置而不是数据：只改 confirmed 不会重放、不会换 data_gen，所以缓存命中时按当前配置重算
+        assumed, warnings = source_tz_meta(self.s, p.platforms, p.tz)
+        body["meta"].update(source_tz_assumed=assumed, warnings=warnings)
+
     async def _compute(self, p: TrendParams, key: str) -> tuple[dict, int]:
         st = await self.pipeline_state()
+        # 各平台截止：rollup 写的 data_through:{src}；旧水位里没有时退回全局截止
+        through_by = {src: st.get(f"data_through:{src}", st.get("data_through")) for src in p.platforms}
         plan = plan_query(p.start, p.end, p.tz, sealed_until=st.get("sealed_until"),
-                          data_through=st.get("data_through"), preset_timezones=self.s.preset_timezones)
+                          data_through=st.get("data_through"), preset_timezones=self.s.preset_timezones,
+                          platform_through=through_by)
         cells = await self._call_store("run_plan", plan, p.class_slug, p.rule_version, p.tz,
                                        list(p.platforms))
-        body = self.assemble(p, plan, cells, st.get("data_through"))
+        assumed, warnings = source_tz_meta(self.s, p.platforms, p.tz)
+        body = self.assemble(p, plan, cells, st.get("data_through"), through_by=through_by,
+                             source_tz_assumed=assumed, warnings=warnings)
         ttl = TTL_SEALED_S if plan.fully_sealed else TTL_OPEN_S
         if self.cache:
             await self.cache.set(key, {**body, "meta": {**body["meta"], "_sealed": plan.fully_sealed}}, ttl)
@@ -106,10 +151,15 @@ class TrendService:
         return body, ttl
 
     @staticmethod
-    def assemble(p: TrendParams, plan, cells: dict, data_through: datetime | None) -> dict:
-        # 按日补零：没卖出去 = 0；晚于数据截止 = null。前端画折线时 null 断开、0 落地，含义不同
+    def assemble(p: TrendParams, plan, cells: dict, data_through: datetime | None, *,
+                 through_by: dict[str, datetime | None] | None = None, source_tz_assumed: bool = False,
+                 warnings: list[dict] | None = None) -> dict:
+        # 按日补零：没卖出去 = 0；晚于该平台的数据截止 = null。前端画折线时 null 断开、0 落地，含义不同
+        def is_null(d: date, src: str) -> bool:
+            return d in plan.null_dates or d in plan.null_by_platform.get(src, ())
+
         daily: dict[str, dict[date, int | None]] = {
-            src: {d: (None if d in plan.null_dates else cells.get((d, src), 0)) for d in plan.days}
+            src: {d: (None if is_null(d, src) else cells.get((d, src), 0)) for d in plan.days}
             for src in p.platforms
         }
         buckets = sorted({_bucket(d, p.granularity) for d in plan.days})
@@ -128,8 +178,22 @@ class TrendService:
                  else sum(s["values"][i] or 0 for s in series) for i in range(len(buckets))]
         sums = {s["platform"]: sum(v or 0 for v in s["values"]) for s in series}
         sums["all"] = sum(sums.values())
+        data = {"dates": [d.isoformat() for d in labels], "series": series, "total": total}
+        if p.granularity != "day":
+            # 不完整周期给日均：3 月只到 13 号，按月合计像「崩了」，日均才可比。
+            # days_covered = 桶内落在查询区间、且至少一个选中平台已有数据的日（截止当天算一整天）
+            covered = [sum(1 for d in plan.days if _bucket(d, p.granularity) == b and d not in plan.null_dates)
+                       for b in buckets]
+            sizes = [_bucket_len(b, p.granularity) for b in buckets]
+            data["days_in_bucket"] = sizes
+            data["days_covered"] = covered
+            data["partial"] = [
+                c < n or any(_bucket(d, p.granularity) == b for d in plan.partial_dates)
+                for b, c, n in zip(buckets, covered, sizes, strict=True)]
+            data["daily_avg"] = [None if not c or t is None else round(t / c, 1)
+                                 for t, c in zip(total, covered, strict=True)]
         return {
-            "data": {"dates": [d.isoformat() for d in labels], "series": series, "total": total},
+            "data": data,
             "meta": {
                 "class_slug": p.class_slug,
                 "rule_version": p.rule_version,
@@ -139,7 +203,11 @@ class TrendService:
                 "end_date": p.end.isoformat(),
                 "platforms": list(p.platforms),
                 "data_through": _iso_z(data_through),
+                # 从各平台最新事件推断，不是采集侧心跳：平台真的整天零销量时会被误判成 null
+                "data_through_by_platform": {src: _iso_z(t) for src, t in (through_by or {}).items()},
                 "partial_dates": sorted(d.isoformat() for d in plan.partial_dates),
+                "source_tz_assumed": source_tz_assumed,
+                "warnings": warnings or [],
                 "sum": sums,
                 "plan": [seg.describe() for seg in plan.segments],
                 "cache": "miss",

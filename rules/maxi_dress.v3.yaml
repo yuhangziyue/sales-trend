@@ -1,0 +1,107 @@
+# maxi dress 识别规则 v3（影子版本）：中心词 + 长度槽
+#
+# v1/v2 判的是「词集合里有没有 maxi 和 dress」，词序信息全丢了，于是：
+#   - "Maxi Dress Belt" / "Maxi Dress Sewing Pattern" 卖的是腰带、纸样，却因为两个词都在被判 match
+#   - "Ankle-Length Wrap Dress" / "Floor-Length ... Gown" 没写 maxi 字样就漏掉
+# v3 把标题拆成两个槽：
+#   - 中心词槽：截断后前半段里最后一个品类词，决定「这是不是一条连衣裙」
+#   - 长度槽：strong / weak / conflict 三档词，决定「是不是长款」
+# 词表全部在本文件里，引擎（rules.py 的 HeadSlotRuleSet）不认识任何具体单词。
+rule_type: head_slot     # 新规则类型；没有这个字段的 yaml 继续走 v1/v2 的词集合引擎
+class_slug: maxi-dress
+rule_version: v3
+default: false
+description: 中心词是连衣裙 + 长度槽为 strong（maxi / floor length …）；只写 long 或长度冲突判待审（影子版本）
+
+normalize:
+  - lowercase
+  - strip_possessive        # women's / womens -> women，与 v1 同一实现
+  - punct_to_space_unicode  # 与 v1 的 punct_to_space 不同：保留中日文字符，否则「碎花长裙」整串被抹掉
+  - collapse_spaces
+  - split_compounds         # 粘连复合词按下表拆开
+  - cjk_segment             # 中日文无空格，按 cjk_words 做最长子串切分
+
+# 粘连复合词拆分表：只拆登记过的词。sundress 故意不拆，它本身就在 dress 簇里，
+# 拆成 sun dress 也不改变判定，但会让 sun 这种无关词混进 token 流
+compounds:
+  maxidress: maxi dress
+  maxidresses: maxi dresses
+  maxikleid: maxi kleid
+  shirtdress: shirt dress
+  slipdress: slip dress
+
+# CJK 子串词表：一个 CJK 连续串内从左到右取最长匹配，没匹配上的字直接丢弃。
+# 只求覆盖演示样例，不是分词器（见 docs/classification-v3.md 已知局限）
+cjk_words: [连衣裙, 半身裙, 长袖, 短袖, 无袖, 长裙, 裙, 长, 短, ワンピース, スカート, マキシ, ロング, ミディ, ミニ]
+cjk_expand:
+  长裙: [长, 裙]     # 长裙 = weak 长度词 + 歧义品类词「裙」，拆开后两个槽各取所需
+
+# 属性短语：先从长度槽里剔除，再匹配 strong / weak / conflict。
+# "Short Sleeve Maxi Dress" 的 short 修饰袖子，不能算成 conflict；"Long Sleeve Dress" 的 long 也不是裙长。
+# 只剔除「长度词 + sleeve/袖」的整体短语，单独的 short（"Short Maxi Dress"）照常进长度槽
+attribute_phrases: [short sleeve, short sleeves, short sleeved, long sleeve, long sleeves, long sleeved,
+                    sleeveless, cap sleeve, cap sleeves, 长袖, 短袖, 无袖]
+
+# 截断词：中心词只在第一个截断词之前找。"Maxi Dress with Belt" 的中心词是 dress 不是 belt
+# 截断词前面还没出现品类词时不截（"Mother and Daughter Maxi Dress"），跳过它继续往后找
+cut_words: [with, for, and]
+
+# 用途排除：只看被截掉的、以 for 开头的尾段。
+# 不在全标题里查 doll——"Doll Collar Maxi Dress" 的 doll 是领型
+use_exclusion:
+  id: U1_non_wearable_use
+  tail_lead: [for]
+  words: [doll, dolls, pet, pets, dog, dogs, cat, cats]
+  decision: exclude
+
+head:
+  # dress 簇：中心词落在这里才可能是 maxi dress
+  target: [dress, dresses, gown, gowns, frock, frocks, sundress, sundresses, kleid, kleider,
+           robe, vestido, vestidos, ワンピース, 连衣裙]
+  # 品类有歧义：kaftan/abaya 介于连衣裙与外袍之间，「裙」不分连衣裙和半身裙，交人工
+  ambiguous: [kaftan, kaftans, caftan, caftans, abaya, abayas, 裙]
+  other_garment: [skirt, skirts, top, tops, cardigan, cardigans, coat, coats, jacket, jackets,
+                  shirt, shirts, blouse, blouses, pants, trousers, jeans, shorts, jumpsuit, jumpsuits,
+                  romper, rompers, sweater, sweaters, hoodie, hoodies, tee, cami, vest,
+                  shoes, boots, sneakers, sandals, 半身裙, スカート]
+  # 配件和非穿着物：pattern 只有当中心词时才排除，"Floral Pattern Maxi Dress" 的中心词仍是 dress
+  non_wearable: [belt, belts, hanger, hangers, pattern, patterns, doll, dolls, bag, bags,
+                 sticker, stickers, mannequin, fabric]
+  ids:
+    missing: H0_no_head
+    other_garment: H1_head_other_garment
+    ambiguous: H2_head_ambiguous
+    non_wearable: H3_head_non_wearable
+  decisions:
+    missing: exclude
+    other_garment: exclude
+    ambiguous: review
+    non_wearable: exclude
+
+# 长度槽：在截断后的前半段里按短语匹配（连字符已变空格，所以写 floor length 而不是 floor-length）
+length:
+  strong: [maxi, floor length, ankle length, full length, maxi length, マキシ]
+  weak: [long, longue, largo, lang, 长, ロング]
+  conflict: [midi, mini, knee length, tea length, short, ミディ, ミニ, 短]
+
+# 长度槽判定表：中心词已确认是 dress 簇之后才走到这里；自上而下，命中即停
+rules:
+  - id: S2_strong_with_conflict
+    when: {strong: true, conflict: true}
+    decision: review     # "Midi to Maxi Convertible Dress"：两头都写了，交人工
+  - id: S1_strong
+    when: {strong: true}
+    decision: match
+  - id: S3_weak_only
+    when: {weak: true}
+    decision: review     # "Elegant Long Dress"：long 在 midi 到 maxi 之间都可能；weak 与 conflict 并存也归这里，宁可多审不可错排
+  - id: S4_conflict_only
+    when: {conflict: true}
+    decision: exclude    # Midi / Mini Dress
+  - id: S0_no_length
+    decision: exclude    # "Casual Dress"
+
+consistency_checks:
+  - id: C1_category_conflict
+    when: {head_in: target, category_not_in: [dress]}
+    action: warn         # T-shirt Dress（2018，类目 shirt）：中心词是 dress，只告警不改判

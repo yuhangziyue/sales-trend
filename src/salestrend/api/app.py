@@ -16,6 +16,7 @@ from ..service import TrendService
 from ..settings import Settings, get_settings
 from .errors import Problem, problem_handler
 from .params import parse_trend_params
+from .schemas import TrendResponse
 
 log = logging.getLogger("salestrend")
 
@@ -83,7 +84,9 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
         st = await app.state.service.pipeline_state()
         return {"data": {k: v.strftime("%Y-%m-%dT%H:%M:%SZ") for k, v in sorted(st.items())}}
 
-    @app.get("/v1/product-classes/{class_slug}/sales-trend", tags=["trend"])
+    @app.get("/v1/product-classes/{class_slug}/sales-trend", tags=["trend"], responses={
+        200: {"model": TrendResponse, "description": "列式趋势。week / month 额外带 days_in_bucket、days_covered、"
+                                                      "partial、daily_avg 四个平行数组；day 粒度不带"}})
     async def sales_trend(
         request: Request,
         class_slug: str,

@@ -29,11 +29,24 @@ class Settings:
     rate_burst: int = _env_int("RATE_LIMIT_BURST", 100)
     max_range_days: int = 366
     rules_dir: Path = ROOT / "rules"
-    platforms: dict[str, str] = field(default_factory=dict)
+    platforms: dict[str, str] = field(default_factory=dict)          # 平台 → 源时区
+    source_tz_confirmed: dict[str, bool] = field(default_factory=dict)  # 平台 → 源时区是否已与采集方确认
     preset_timezones: tuple[str, ...] = ()
+
+
+def parse_platforms(raw: dict) -> tuple[dict[str, str], dict[str, bool]]:
+    """两种写法都收：`app: UTC`（旧写法，视为未确认）与 `app: {source_tz: UTC, confirmed: true}`。"""
+    tzs, confirmed = {}, {}
+    for name, v in raw.items():
+        if isinstance(v, str):
+            tzs[name], confirmed[name] = v, False
+        else:
+            tzs[name], confirmed[name] = v["source_tz"], bool(v.get("confirmed", False))
+    return tzs, confirmed
 
 
 @lru_cache(1)
 def get_settings() -> Settings:
     cfg = yaml.safe_load((ROOT / "config" / "platforms.yaml").read_text())
-    return Settings(platforms=dict(cfg["platforms"]), preset_timezones=tuple(cfg["preset_timezones"]))
+    tzs, confirmed = parse_platforms(cfg["platforms"])
+    return Settings(platforms=tzs, source_tz_confirmed=confirmed, preset_timezones=tuple(cfg["preset_timezones"]))

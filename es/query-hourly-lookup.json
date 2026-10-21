@@ -1,0 +1,30 @@
+{
+  "_comment": "GET sales_hourly_product/_search?request_cache=true —— 读小时汇总 + terms lookup 引用品类成员文档。成员文档事先写入：PUT class_members/_doc/maxi-dress@v1 {\"product_ids\": [2001, 2002, ...]}。改规则只重写这一个成员文档，汇总索引不动",
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "terms": { "product_id": { "index": "class_members", "id": "maxi-dress@v1", "path": "product_ids" } } },
+        { "terms": { "source": ["app", "website"] } },
+        { "range": { "hour": { "gte": "2024-01-01", "lt": "2024-04-01", "time_zone": "Asia/Shanghai" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_day": {
+      "date_histogram": {
+        "field": "hour",
+        "calendar_interval": "1d",
+        "time_zone": "Asia/Shanghai",
+        "min_doc_count": 0,
+        "extended_bounds": { "min": "2024-01-01", "max": "2024-03-31" }
+      },
+      "aggs": {
+        "by_source": {
+          "terms": { "field": "source", "size": 20 },
+          "aggs": { "sales": { "sum": { "field": "sales" } } }
+        }
+      }
+    }
+  }
+}

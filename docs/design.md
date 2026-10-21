@@ -57,10 +57,24 @@ DDL：[`sql/ddl/001_tables.sql`](../sql/ddl/001_tables.sql)。
 
 ### 3.1 时区
 
-- timestamp 不带时区。每个平台在 [`config/platforms.yaml`](../config/platforms.yaml) 配一个**源时区**，解析时转成 UTC 存储，原文保留在 `ts_raw`，改配置后可重放。
-- 样例默认全按 UTC。**依据与风险**：小时分布集中在 07–22 点，更像本地时间；换成 Asia/Shanghai 解析，2 月销量差 30 件（约 7%）。时区是采集契约，不该由查询方猜，生产须与采集方确认。
+- timestamp 不带时区。每个平台在 [`config/platforms.yaml`](../config/platforms.yaml) 配一个**源时区**和**是否已与采集方确认**（`{source_tz: UTC, confirmed: false}`），解析时转成 UTC 存储，原文保留在 `ts_raw`，改配置后可重放。旧写法 `app: UTC` 仍可解析，按未确认处理：默认未确认只会多一条警告，默认确认则可能把猜出来的时区当成事实、静默算错。
+- 样例三个平台都是**未确认**，暂按 UTC 解析。依据：三个平台的时间戳都落在 07–22 点（另有 4 条月末边界探针），像同一时区的本地营业时间，但看不出是哪个时区。按 UTC 解析、按 UTC 出报表，等于**按时间戳上写的日期原样切日**，不管真实源时区是什么，这个结果都对。
+- 真正的风险在请求的 `tz`。设源时间其实是北京时间：按 UTC 入库后再请求 `tz=Asia/Shanghai`，每条事件又被往后推 8 小时，2 月合计从 445 变成 **415**。所以 415 只在「源时间是 UTC」的假设下成立；如果源时间本来就是北京时间，按北京时间出报表应是 **445**，与原样切日相同（集成测试 `tests/integration/test_source_tz.py` 用管线 + 内存存储证明了这一点，不改全局配置）。
+- 因此不拒绝请求，但会说出来：响应 `meta.source_tz_assumed` 表示选中平台里有未确认的源时区；当请求 `tz` 与某个未确认平台的源时区不同时，`meta.warnings` 带一条 `SOURCE_TZ_UNCONFIRMED`（`code`、`message`、`platforms`、`source_tz`），提示换算可能引入整体偏移。`tz` 与源时区相同时换算是恒等的，不告警。警告由配置算出、不来自数据，缓存命中时按当前配置重算。
 - 默认 UTC 而不是 Asia/Shanghai：UTC 没有夏令时，假设错了也只是整体平移，不会一年两次跳变。
 - 报表时区由请求的 `tz` 决定（IANA 名），只接受 IANA 名，不接受 `+08:00`：固定偏移处理不了夏令时。
+
+**时区来源的三种情况**：
+
+| 情况 | 含义 | 怎么处理 |
+|---|---|---|
+| 统一记 UTC | 采集端统一打 UTC 时间 | `source_tz: UTC, confirmed: true`，任何报表时区都是精确换算 |
+| 各地按本地时间上报 | 每个平台（或站点）用自己所在地的本地时间 | 每个平台配自己的 IANA 源时区并确认；夏令时地区要求带偏移，见下 |
+| 未确认 | 不知道是哪种 | **这份样例属于这一种**：按原样切日最安全，换时区出报表时告警 |
+
+- **采集契约应要求时间戳带偏移量**（ISO 8601，例如 `2024-02-01T07:00-05:00`）。只给本地时间加一个时区名，在夏令时回拨那天 01:00–02:00 会出现两次，无法判断是哪一次；带了偏移量，每个时刻都能唯一换算成 UTC。源时区配置只用来兜底不带偏移的旧数据。
+- **两种报表模式**：① 统一时钟——所有平台按同一个 `tz` 切日，用于汇总、对账；② 各市场本地日——每个市场按自己的本地日切，用于比较不同市场的购买行为（例如「各地晚上 8 点的高峰」）。汇总表按 UTC 小时存，这两种模式都不用重算：前者整表按一个时区切，后者按市场各自的时区切再拼起来。**当前只实现了统一时钟**。
+- 样例里没有大区（region / market）字段。`app` / `marketplace` / `website` 是**渠道**，不等于地理区域，不能拿平台当市场去按本地日切；做第二种报表模式需要采集端补充区域字段。
 
 ### 3.2 去重
 
@@ -125,7 +139,12 @@ DDL：[`sql/ddl/001_tables.sql`](../sql/ddl/001_tables.sql)。
 | B 小时表 | tz 不在预设列表但当天是整点偏移，且已封口 | agg_product_hourly |
 | C 明细 | 当天未封口；或非整点偏移且不在预设列表 | fact_sales |
 
-3. 晚于 `data_through` 的日子返回 **null**（还没数据），不是 0（没卖出去）；包含截止时刻的日标为 `partial_dates`。
+3. **null 与 partial 按平台判**。每个平台有自己的截止时间（`data_through:{src}`，rollup 时取该平台最新事件），晚于它的日子对这个平台返回 **null**（还没数据），不是 0（没卖出去）；截止时刻所在的那一天对这个平台不完整。样例里 marketplace 截止 03-11 15:15Z、website 截止 03-12 18:05Z、app 截止 03-13 09:45Z，所以 marketplace 03-12 起、website 03-13 起为 null。
+   - `total`：选中平台全部为 null → null；只有部分平台为 null → 非 null 平台之和，并把这一天加进 `partial_dates`。合计 `sum` 不受影响（null 按 0 计，本来就是 0）。
+   - `partial_dates` = 任一选中平台的截止日 ∪ 部分平台已为 null 的日。
+   - 查库范围以选中平台里最晚的截止为准；全部平台都为 null 的日不查库。
+   - 响应 `meta.data_through_by_platform` 回显各平台截止。它是**推断值**：平台某天真的零销量时，会被误判成 null。生产环境应由采集侧上报心跳与接收水位（「这个平台的数据已经收到某时刻」），用它取代推断。
+   - 只要有任何平台的 null 日，就按「未封口」走 60 秒 TTL：这些日子随时可能来数据。
 4. 连续同段的日合并成一次查询；三段结果合并后在应用层统一补零。
 5. 响应 `meta.plan` 回显各段覆盖的日期和读的表。
 
@@ -154,7 +173,11 @@ GET /healthz · /readyz
 | 日期 | 对外闭区间，对内半开 | 人说「1 号到 31 号」包含 31 号 |
 | 出参 | 列式 `dates` + `series[].values` | 图表库直接用，体积约为行式三分之一 |
 | 空值 | 0 与 null 区分 | 前端画折线时 null 断开、0 落地，含义不同 |
+| 不完整周期 | week / month 加平行数组 `days_in_bucket` `days_covered` `partial` `daily_avg` | 3 月只到 13 号，按月合计 484 / 445 / 188 像「3 月崩了」，日均 15.6 / 15.3 / 14.5 其实基本持平 |
+| 提示 | `meta.warnings` 数组，结构化 `code` + `message` | 不该拒绝、但调用方需要知道的情况（如源时区未确认），与错误码同一套命名 |
 | 错误体 | RFC 9457 `application/problem+json` + `code` + `invalid_params` | 有标准，网关与前端都认识 |
+
+**周 / 月桶的口径**：`days_in_bucket` 是桶本身的天数（周 7，月 28–31），不随查询区间裁剪；`days_covered` 是桶内落在查询区间、且不晚于数据截止（选中平台里最晚的一个）的天数，截止当天虽不完整也算一整天——样例 3 月正好是 13 天，日均 188 / 13 = 14.5，略偏保守；`partial` = `days_covered < days_in_bucket` 或桶内含 `partial_dates`；`daily_avg` = total / days_covered，一位小数，days_covered 为 0 时为 null。只给 total 的日均：各平台截止不同，按平台日均要用各自的覆盖天数，这次不做，调用方可用 `data_through_by_platform` 折算。`day` 粒度不带这四个字段：一天的桶没有「覆盖了几天」可言，不完整的日已经由 `partial_dates` 表达。
 
 11 个错误码：`INVALID_DATE` `RANGE_INVERTED` `RANGE_TOO_LARGE` `UNKNOWN_PLATFORM` `INVALID_TZ` `INVALID_GRANULARITY`（400）、`CLASS_NOT_FOUND` `RULE_VERSION_NOT_FOUND`（404）、`RATE_LIMITED`（429，带 `Retry-After`）、`UPSTREAM_UNAVAILABLE`（503）、`QUERY_TIMEOUT`（504）。每个都有测试。
 
@@ -164,7 +187,7 @@ GET /healthz · /readyz
 
 | 问题 | 做法 |
 |---|---|
-| 存储扛不住 | Redis cache-aside。key 规范化（平台排序去重），含 `rule_version` 与 `data_gen`，改规则或回填后旧 key 自然作废，不用枚举删除 |
+| 存储扛不住 | Redis cache-aside。key 规范化（平台排序去重），含 `rule_version`、`data_gen` 与响应结构版本，改规则、回填或改响应结构后旧 key 自然作废，不用枚举删除 |
 | 历史数据不变 | **分档 TTL**：区间全部已封口 24 小时；含未封口或未来日 60 秒；±10% 抖动防雪崩 |
 | 缓存击穿 | singleflight：同 key 并发未命中只放一个请求查库 |
 | 缓存穿透 | 品类列表进程内常驻，未知品类直接 404 不碰存储 |

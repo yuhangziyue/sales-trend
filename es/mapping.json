@@ -19,6 +19,7 @@
       "source":       { "type": "keyword" },
       "sales_count":  { "type": "integer" },
       "event_ts":     { "type": "date" },
+      "ingest_ts":    { "type": "date" },
       "ts_raw":       { "type": "keyword", "index": false },
       "dq_flags":     { "type": "keyword" }
     }

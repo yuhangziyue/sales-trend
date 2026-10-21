@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from .errors import param_error
 
 GRANULARITIES = ("day", "week", "month")
+# 响应结构版本：加字段后递增。否则上线后、下一次回填前，旧结构的缓存还会按 24 小时 TTL 继续返回
+RESPONSE_SCHEMA = "r2"
 _IANA = available_timezones() | {"UTC"}
 
 
@@ -24,8 +26,8 @@ class TrendParams:
 
     def cache_key(self, data_gen: str) -> str:
         # 平台已排序去重：app,website 与 website,app 命中同一个 key；
-        # key 含规则版本和数据代号：改规则或回填后旧 key 自然作废，不用枚举删除
-        return ":".join(["trend", self.class_slug, self.rule_version, data_gen, self.tz, self.granularity,
+        # key 含规则版本和数据代号：改规则或回填后旧 key 自然作废，不用枚举删除；含结构版本：改响应结构同理
+        return ":".join(["trend", RESPONSE_SCHEMA, self.class_slug, self.rule_version, data_gen, self.tz, self.granularity,
                          self.start.isoformat(), self.end.isoformat(), ",".join(self.platforms)])
 
 

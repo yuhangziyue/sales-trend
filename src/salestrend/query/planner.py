@@ -6,6 +6,9 @@
 
 已封口的读物化结果、未封口的读明细，是 Druid / Timescale 实时聚合的通用思路；
 这里多做的一步是把「时区」也纳入分段条件。规划是纯函数，执行在 executor 里。
+
+null / partial 按平台判：每个平台有自己的截止时间（从该平台最新事件推断），
+晚于它的日子对这个平台是 null，包含它的那天对这个平台不完整。
 """
 
 from __future__ import annotations
@@ -56,18 +59,26 @@ class Segment:
 class Plan:
     days: list[date]
     segments: list[Segment] = field(default_factory=list)
-    null_dates: set[date] = field(default_factory=set)      # 晚于数据截止：返回 null，不是 0
-    partial_dates: set[date] = field(default_factory=set)   # 包含数据截止时刻、尚不完整的日
+    null_dates: set[date] = field(default_factory=set)      # 晚于所有选中平台的截止：返回 null，不查库
+    partial_dates: set[date] = field(default_factory=set)   # 某个平台不完整或为 null、但不是全部 null 的日
     fully_sealed: bool = True                               # 决定缓存 TTL 档位
+    null_by_platform: dict[str, set[date]] = field(default_factory=dict)  # 晚于该平台截止的日
 
 
 def plan_query(start: date, end: date, tz_name: str, *, sealed_until: datetime | None,
                data_through: datetime | None, preset_timezones: tuple[str, ...],
-               force: str | None = None) -> Plan:
-    """force 仅供对拍测试：强制所有可查日走同一段，验证三条路径结果一致。"""
+               force: str | None = None, platform_through: dict[str, datetime | None] | None = None) -> Plan:
+    """force 仅供对拍测试：强制所有可查日走同一段，验证三条路径结果一致。
+
+    platform_through 给出选中平台各自的截止时间；给了就以其中最晚的一个作为 data_through
+    （查库范围 = 至少有一个平台有数据的日），再逐平台标 null 与 partial。
+    """
     tz = ZoneInfo(tz_name)
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
     plan = Plan(days=days)
+    if platform_through:
+        known = [t for t in platform_through.values() if t is not None]
+        data_through = max(known) if known else None
     through_local = data_through.astimezone(tz).date() if data_through else None
 
     kinds: list[tuple[date, str]] = []
@@ -96,6 +107,14 @@ def plan_query(start: date, end: date, tz_name: str, *, sealed_until: datetime |
             plan.segments[-1].dates.append(d)
         else:
             plan.segments.append(Segment(kind, [d]))
-    if plan.null_dates:  # 还没数据的日子随时可能来数据，不能按「已封口」长缓存
-        plan.fully_sealed = False
+    for src, through in (platform_through or {}).items():
+        local = through.astimezone(tz).date() if through else None
+        nulls = {d for d in days if local is None or d > local}
+        plan.null_by_platform[src] = nulls
+        if local in days:
+            plan.partial_dates.add(local)  # 该平台截止时刻所在的日，对它不完整
+        # 部分平台 null、部分有数：total 只是有数平台之和，这一天同样不完整
+        plan.partial_dates |= nulls - plan.null_dates
+    if plan.null_dates or any(plan.null_by_platform.values()):
+        plan.fully_sealed = False  # 还没数据的日子随时可能来数据，不能按「已封口」长缓存
     return plan

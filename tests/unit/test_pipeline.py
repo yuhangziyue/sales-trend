@@ -73,3 +73,24 @@ def test_source_timezone_is_applied(rows):
     e = next(x for x in sh if x.user_id == "U2092")  # app 2024-02-01 00:05 本地
     assert e.event_ts == datetime(2024, 1, 31, 16, 5, tzinfo=UTC)
     assert e.ts_raw == "2024-02-01 00:05:00"  # 原文保留，可重放
+
+
+def test_platform_config_new_and_legacy_forms():
+    from salestrend.settings import parse_platforms
+
+    tzs, confirmed = parse_platforms({"app": "UTC", "web": {"source_tz": "Asia/Shanghai", "confirmed": True},
+                                      "mkt": {"source_tz": "Europe/London"}})
+    assert tzs == {"app": "UTC", "web": "Asia/Shanghai", "mkt": "Europe/London"}
+    assert confirmed == {"app": False, "web": True, "mkt": False}  # 旧写法与省略 confirmed 都按未确认
+
+
+def test_sample_platforms_are_unconfirmed(settings):
+    assert settings.platforms == {"app": "UTC", "marketplace": "UTC", "website": "UTC"}
+    assert not any(settings.source_tz_confirmed.values())
+
+
+def test_source_tz_shanghai_parses_to_utc_minus_8(settings):
+    row = {"product_id": 2001, "title": "Maxi Dress", "sales_count": 1, "timestamp": "2024-03-01 07:30:00",
+           "user_id": "U1", "category": "dress", "source": "app"}
+    e = process([row], {"app": "Asia/Shanghai"})[0]
+    assert e.event_ts == datetime(2024, 2, 29, 23, 30, tzinfo=UTC) and e.source_tz == "Asia/Shanghai"

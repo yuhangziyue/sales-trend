@@ -196,6 +196,134 @@ def test_list_classes_and_detail():
     c, _ = client()
     r = c.get("/v1/product-classes").json()["data"]
     assert r[0]["class_slug"] == "maxi-dress" and r[0]["default_rule_version"] == "v1"
-    assert r[0]["rule_versions"] == ["v1", "v2"]
+    assert r[0]["rule_versions"] == ["v1", "v2", "v3"]
     d = c.get("/v1/product-classes/maxi-dress").json()["data"]
     assert d["rules"][0]["id"] == "R2_other_garment"
+
+
+# ---------- A1 按平台截止 ----------
+BY_SRC_STATE = {**STATE, "data_through:app": datetime(2024, 3, 13, 9, 45, tzinfo=UTC),
+                "data_through:marketplace": datetime(2024, 3, 11, 15, 15, tzinfo=UTC),
+                "data_through:website": datetime(2024, 3, 12, 18, 5, tzinfo=UTC)}
+
+
+class PerPlatformStore(FakeStore):
+    def state(self):
+        return BY_SRC_STATE
+
+
+def test_per_platform_cutoff_null_and_total():
+    c, _ = client(store=PerPlatformStore())
+    r = c.get(URL, params={"start_date": "2024-03-10", "end_date": "2024-03-15"}).json()
+    got = {s["platform"]: s["values"] for s in r["data"]["series"]}
+    assert got == {"app": [1, 1, 1, 1, None, None], "marketplace": [1, 1, None, None, None, None],
+                   "website": [1, 1, 1, None, None, None]}
+    assert r["data"]["total"] == [3, 3, 2, 1, None, None]  # 部分 null：非 null 平台之和；全部 null：null
+    assert r["meta"]["partial_dates"] == ["2024-03-11", "2024-03-12", "2024-03-13"]
+    assert r["meta"]["data_through_by_platform"] == {
+        "app": "2024-03-13T09:45:00Z", "marketplace": "2024-03-11T15:15:00Z", "website": "2024-03-12T18:05:00Z"}
+    assert r["meta"]["data_through"] == "2024-03-13T09:45:00Z"
+
+
+def test_per_platform_cutoff_single_platform():
+    c, _ = client(store=PerPlatformStore())
+    r = c.get(URL, params={"start_date": "2024-03-10", "end_date": "2024-03-15", "platforms": "marketplace"}).json()
+    assert r["data"]["total"] == [1, 1, None, None, None, None]
+    assert r["meta"]["partial_dates"] == ["2024-03-11"]
+    assert list(r["meta"]["data_through_by_platform"]) == ["marketplace"]
+
+
+def test_state_without_per_platform_keys_falls_back_to_global():
+    c, _ = client()
+    r = c.get(URL, params={"start_date": "2024-03-12", "end_date": "2024-03-13"}).json()
+    assert r["data"]["total"] == [3, 3]
+    assert set(r["meta"]["data_through_by_platform"].values()) == {"2024-03-13T09:45:00Z"}
+
+
+# ---------- A2 不完整周期的日均 ----------
+def test_month_bucket_daily_avg_and_partial():
+    c, _ = client(store=PerPlatformStore())
+    r = c.get(URL, params={"start_date": "2024-01-01", "end_date": "2024-03-31", "granularity": "month"}).json()
+    d = r["data"]
+    assert d["days_in_bucket"] == [31, 29, 31]
+    assert d["days_covered"] == [31, 29, 13]  # 3 月：1–13 号，截止当天算一整天
+    assert d["partial"] == [False, False, True]
+    # FakeStore 每平台每天 1 件：1、2 月日均 3.0；3 月 1–10 号 3 件、11 号 3、12 号 2、13 号 1 → 36 / 13
+    assert d["total"][2] == 36 and d["daily_avg"] == [3.0, 3.0, 2.8]
+
+
+def test_week_bucket_clipped_by_range_is_partial():
+    c, _ = client()
+    d = c.get(URL, params={"start_date": "2024-01-03", "end_date": "2024-01-15", "granularity": "week",
+                           "platforms": "app"}).json()["data"]
+    assert d["days_in_bucket"] == [7, 7, 7]
+    assert d["days_covered"] == [5, 7, 1]
+    assert d["partial"] == [True, False, True]
+    assert d["daily_avg"] == [1.0, 1.0, 1.0]
+
+
+def test_bucket_entirely_after_cutoff_has_null_avg():
+    c, _ = client()
+    d = c.get(URL, params={"start_date": "2024-03-01", "end_date": "2024-04-30",
+                           "granularity": "month"}).json()["data"]
+    assert d["days_covered"] == [13, 0] and d["daily_avg"][1] is None and d["total"][1] is None
+    assert d["partial"] == [True, True]
+
+
+def test_day_granularity_has_no_bucket_fields():
+    c, _ = client()
+    d = c.get(URL, params=OK).json()["data"]
+    assert set(d) == {"dates", "series", "total"}
+
+
+# ---------- A4 源时区未确认 ----------
+def test_unconfirmed_source_tz_same_as_request_tz_no_warning():
+    c, _ = client()
+    m = c.get(URL, params=OK).json()["meta"]  # 默认 tz=UTC，与源时区相同：换算是恒等的
+    assert m["source_tz_assumed"] is True and m["warnings"] == []
+
+
+def test_unconfirmed_source_tz_warns_but_still_answers():
+    c, _ = client()
+    r = c.get(URL, params={**OK, "tz": "Asia/Shanghai", "platforms": "app,website"})
+    assert r.status_code == 200
+    (w,) = r.json()["meta"]["warnings"]
+    assert w["code"] == "SOURCE_TZ_UNCONFIRMED" and w["message"]
+    assert w["platforms"] == ["app", "website"] and w["source_tz"] == {"app": "UTC", "website": "UTC"}
+
+
+def test_confirmed_source_tz_no_warning():
+    s = get_settings()
+    c, _ = client(source_tz_confirmed={p: True for p in s.platforms})
+    m = c.get(URL, params={**OK, "tz": "Asia/Shanghai"}).json()["meta"]
+    assert m["source_tz_assumed"] is False and m["warnings"] == []
+
+
+def test_utc_aliases_count_as_same_tz():
+    c, _ = client()
+    assert c.get(URL, params={**OK, "tz": "Etc/UTC"}).json()["meta"]["warnings"] == []
+
+
+def test_cache_hit_reflects_current_tz_confirmation():
+    """只改 confirmed 不重放、不换 data_gen：命中缓存时警告也要按当前配置给。"""
+    from salestrend.service import TrendService
+
+    cache = FakeCache()
+    c, app = client(cache=cache)
+    params = {**OK, "tz": "Asia/Shanghai"}
+    assert c.get(URL, params=params).json()["meta"]["warnings"]
+    svc: TrendService = app.state.service
+    from dataclasses import replace
+
+    svc.s = replace(svc.s, source_tz_confirmed={p: True for p in svc.s.platforms})
+    m = c.get(URL, params=params).json()["meta"]
+    assert m["cache"] == "hit" and m["warnings"] == [] and m["source_tz_assumed"] is False
+
+
+def test_cache_key_carries_response_schema_version():
+    from salestrend.api.params import RESPONSE_SCHEMA, parse_trend_params
+
+    p = parse_trend_params(class_slug="maxi-dress", rule_version="v1", start_date="2024-01-01",
+                           end_date="2024-01-31", platforms=None, tz=None, granularity=None,
+                           known_platforms=["app"], max_days=366)
+    assert p.cache_key("7").startswith(f"trend:{RESPONSE_SCHEMA}:maxi-dress:v1:7:")
