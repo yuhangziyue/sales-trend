@@ -1,0 +1,11 @@
+{
+  "_source": "对附件 sample-sales-data.xlsx 独立核算（去重后，三个平台按 UTC 解析）",
+  "fact_rows": 288,
+  "duplicates": 12,
+  "match_ids": [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012],
+  "sum_utc": {"app": 368, "marketplace": 372, "website": 377, "all": 1117},
+  "by_month_utc": {"2024-01-01": 484, "2024-02-01": 445, "2024-03-01": 188},
+  "first_three_days_utc": {"app": [10, 13, 0], "marketplace": [0, 0, 7], "website": [19, 0, 0]},
+  "feb_total_shanghai": 415,
+  "elegant_long_dress_sales": 100
+}

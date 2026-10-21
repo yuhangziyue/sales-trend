@@ -1,0 +1,30 @@
+# maxi dress 识别规则 v1（当前默认版本）
+#
+# 判定依据是「标题词集合」，不是原始 category：
+#   - 按词集合而不是字符串：LIKE '%maxi dress%' 会漏掉 2008 的 "Maxi Denim Dress"
+#   - category 只做冲突告警，不做必要条件：2018 "T-shirt Dress" 被标成 shirt，类目本身不可全信
+class_slug: maxi-dress
+rule_version: v1
+default: true
+description: 标题同时含 maxi 与 dress/gown/sundress 的商品；只写 long 的判待审不计入
+normalize:
+  - lowercase
+  - strip_possessive   # women's / womens -> women
+  - punct_to_space     # 连字符、下划线、斜杠等 -> 空格
+  - collapse_spaces
+rules:                 # 自上而下，命中即停
+  - id: R2_other_garment
+    when: {any_token: [skirt, top, jumpsuit, coat, jacket, pants, shirt], none_token: [dress, gown]}
+    decision: exclude  # Maxi Skirt（2027）在这里被排除
+  - id: R1_maxi_and_dress
+    when: {all_token: [maxi], any_token: [dress, gown, sundress]}
+    decision: match
+  - id: R3_long_ambiguous
+    when: {all_token: [long], any_token: [dress, gown]}
+    decision: review   # Elegant Long Dress（2017）：long 在 midi 到 maxi 之间都可能，交业务确认
+  - id: R0_default
+    decision: exclude
+consistency_checks:
+  - id: C1_category_conflict
+    when: {any_token: [dress], category_not_in: [dress]}
+    action: warn       # T-shirt Dress（2018）触发，只告警不改判

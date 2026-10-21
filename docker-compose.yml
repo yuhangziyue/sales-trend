@@ -1,0 +1,39 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8   # LTS
+    environment:
+      CLICKHOUSE_DB: ${CH_DATABASE:-salestrend}
+      CLICKHOUSE_USER: ${CH_USER:-salestrend}
+      CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-salestrend}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123"]
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  api:
+    build: .
+    environment:
+      CH_HOST: clickhouse
+      CH_DATABASE: ${CH_DATABASE:-salestrend}
+      CH_USER: ${CH_USER:-salestrend}
+      CH_PASSWORD: ${CH_PASSWORD:-salestrend}
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_PER_S: ${RATE_LIMIT_PER_S:-50}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-100}
+    ports: ["8000:8000"]
+    depends_on:
+      clickhouse: {condition: service_healthy}
+      redis: {condition: service_healthy}

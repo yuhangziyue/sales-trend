@@ -1,0 +1,29 @@
+# maxi dress 识别规则 v2（影子版本，演示「规则改版不用重算事实和小时表」）
+#
+# 与 v1 唯一差异：把只写 long 的连衣裙也算进 maxi dress（假设业务确认 long ≈ maxi）。
+# 两个版本并存，API 用 ?rule_version=v2 查询，对比差异后再决定是否切默认版本。
+class_slug: maxi-dress
+rule_version: v2
+default: false
+description: v1 + 只写 long 的连衣裙也计入（影子版本）
+normalize:
+  - lowercase
+  - strip_possessive
+  - punct_to_space
+  - collapse_spaces
+rules:
+  - id: R2_other_garment
+    when: {any_token: [skirt, top, jumpsuit, coat, jacket, pants, shirt], none_token: [dress, gown]}
+    decision: exclude
+  - id: R1_maxi_and_dress
+    when: {all_token: [maxi], any_token: [dress, gown, sundress]}
+    decision: match
+  - id: R3_long_as_maxi
+    when: {all_token: [long], any_token: [dress, gown]}
+    decision: match
+  - id: R0_default
+    decision: exclude
+consistency_checks:
+  - id: C1_category_conflict
+    when: {any_token: [dress], category_not_in: [dress]}
+    action: warn

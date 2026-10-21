@@ -1,0 +1,19 @@
+# 平台注册表：只有登记过的平台才能入库（未登记 = 拒收，防止新平台没配时区就混进来）
+#
+# source_tz 是「这个平台上报的 timestamp 是哪个时区的本地时间」，属于采集契约。
+# 样例数据默认全部按 UTC 解析。注意：样例的小时分布集中在 07–22 点，更像本地营业时间，
+# 生产环境必须与采集方确认后再改；改完重放 ingest 即可，raw 表保留了原始时间文本 ts_raw。
+platforms:
+  app: UTC
+  marketplace: UTC
+  website: UTC
+
+# 预设报表时区：为这些时区物化品类日表（查询走最便宜的 A 段）。
+# Asia/Kolkata 是 +05:30 非整点时区的代表，小时表切不准，所以预先物化。
+preset_timezones:
+  - UTC
+  - Asia/Shanghai
+  - America/Los_Angeles
+  - America/New_York
+  - Europe/London
+  - Asia/Kolkata

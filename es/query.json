@@ -1,0 +1,31 @@
+{
+  "_comment": "GET sales_events/_search?request_cache=true —— maxi dress，app + website，Asia/Shanghai 下 2024 年 1–3 月按日按平台统计",
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "term":  { "class_slugs": "maxi-dress" } },
+        { "term":  { "rule_version": "v1" } },
+        { "terms": { "source": ["app", "website"] } },
+        { "range": { "event_ts": { "gte": "2024-01-01", "lt": "2024-04-01", "time_zone": "Asia/Shanghai" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_day": {
+      "date_histogram": {
+        "field": "event_ts",
+        "calendar_interval": "1d",
+        "time_zone": "Asia/Shanghai",
+        "min_doc_count": 0,
+        "extended_bounds": { "min": "2024-01-01", "max": "2024-03-31" }
+      },
+      "aggs": {
+        "by_source": {
+          "terms": { "field": "source", "size": 20 },
+          "aggs": { "sales": { "sum": { "field": "sales_count" } } }
+        }
+      }
+    }
+  }
+}

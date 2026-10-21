@@ -1,0 +1,42 @@
+[project]
+name = "salestrend"
+version = "1.0.0"
+description = "Sales trend query service: maxi dress daily trend over multi-platform sales events"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "clickhouse-connect>=0.8",
+    "redis>=5.0",
+    "openpyxl>=3.1",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+salestrend = "salestrend.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/salestrend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs a running ClickHouse (make up && make seed)"]
+
+[tool.ruff]
+line-length = 110
+src = ["src"]
+
+[tool.ruff.lint]
+# 报告文案里有意用隐式拼接把长中文句子拆行
+ignore = ["ISC004"]
