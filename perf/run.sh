@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# make perf：P1 热缓存 / P2 冷混合 / P3 击穿，结果写 perf/results/，汇总成 docs/perf-report.md
+# make perf：P1 热缓存 / P2 冷混合 / P3 击穿 / P6 任意区间命中率 / P4 降级，结果写 perf/results/，汇总成 docs/perf-report.md
+# 只跑一部分：SCENS="range" bash perf/run.sh（make perf-p6）。P5 千万级是单独的 make perf-p5
 set -uo pipefail
+SCENS=${SCENS:-"hot cold herd range degrade"}
+want() { [[ " $SCENS " == *" $1 "* ]]; }
 API=${1:-http://localhost:8000}
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$DIR/perf/results
@@ -18,15 +21,20 @@ run() {  # $1 场景名
   echo "$1 exit=$?"
 }
 
+if want hot; then
 echo "== P1 hot：先预热 20 个热点 key"
 $DC exec -T redis redis-cli FLUSHALL >/dev/null
 k6 run --quiet -e SCEN=hot -e API="$API" --iterations 400 --vus 20 "$DIR/perf/k6/scenarios.js" >/dev/null 2>&1
 run hot
+fi
 
+if want cold; then
 echo "== P2 cold：清空缓存后按 70/25/5 混合"
 $DC exec -T redis redis-cli FLUSHALL >/dev/null
 run cold
+fi
 
+if want herd; then
 echo "== P3 herd：同一冷 key 500 并发"
 $DC exec -T redis redis-cli FLUSHALL >/dev/null
 ch "SYSTEM FLUSH LOGS"
@@ -38,20 +46,36 @@ ch "SYSTEM FLUSH LOGS"
 ch "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND event_time_microseconds >= '$T0'
     AND query LIKE '%agg_class_daily%' AND query NOT LIKE '%system.query_log%'" > "$OUT/herd_storage_queries.txt"
 echo "herd storage queries: $(cat "$OUT/herd_storage_queries.txt")"
+fi
 
+if want range; then
+# 命中率与回源率从 /metrics 前后快照的差值算（多 worker 已由多进程模式汇总），k6 按 X-Cache 头计数交叉验证。
+# 只清 trend 缓存，不 FLUSHALL：data_gen 也在 Redis 里，清掉会让 key 前缀变化，但对「从空缓存开始」没有区别
+for s in range hot200; do
+  echo "== P6 ${s}：清空 trend 缓存后 200 RPS × 120s"
+  $DC exec -T redis sh -c "redis-cli --scan --pattern '*trend:*' | xargs -r redis-cli DEL" >/dev/null
+  curl -s "$API/metrics" > "$OUT/${s}_metrics_before.txt"
+  run "$s"
+  curl -s "$API/metrics" > "$OUT/${s}_metrics_after.txt"
+done
+fi
+
+if want degrade; then
 echo "== P4 降级：停掉 ClickHouse"
 U="$API/v1/product-classes/maxi-dress/sales-trend"
-code() { curl -s -o "$OUT/p4_body.json" -w "%{http_code}" "$1"; }
+code() { curl -s -D "$OUT/p4_headers.txt" -o "$OUT/p4_body.json" -w "%{http_code}" "$1"; }
 curl -s -o /dev/null "$U?start_date=2024-01-01&end_date=2024-01-31"           # 先让这个 key 进缓存
 $DC exec -T redis sh -c "redis-cli --scan --pattern 'trend:*' | xargs -r redis-cli DEL" >/dev/null  # 新鲜副本过期，只剩 stale 副本
 $DC stop clickhouse >/dev/null
 {
   echo "cached_key_status=$(code "$U?start_date=2024-01-01&end_date=2024-01-31")"
   echo "cached_key_meta=$(python3 -c 'import json;m=json.load(open("'"$OUT"'/p4_body.json"))["meta"];print(m["cache"], "stale=%s" % m["stale"])')"
+  echo "cached_key_stale_header=$(grep -i '^x-data-stale' "$OUT/p4_headers.txt" | tr -d '\r')"
   echo "uncached_key_status=$(code "$U?start_date=2024-02-02&end_date=2024-02-09")"
   echo "uncached_key_code=$(python3 -c 'import json;print(json.load(open("'"$OUT"'/p4_body.json")).get("code"))')"
 } > "$OUT/degrade.txt"
 $DC start clickhouse >/dev/null && $DC up -d --wait clickhouse >/dev/null
 cat "$OUT/degrade.txt"
+fi
 
 uv run --project "$DIR" python "$DIR/perf/report.py" "$OUT" "$DIR/docs/perf-report.md"

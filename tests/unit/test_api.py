@@ -132,7 +132,24 @@ def test_stale_cache_served_when_storage_down():
     r = c.get(URL, params=OK)
     assert r.status_code == 200
     assert r.json()["meta"]["stale"] is True and r.json()["meta"]["cache"] == "stale"
-    assert "110" in r.headers["Warning"]
+    # RFC 9111 已废弃 Warning 头：改用 X-Data-Stale，且与 meta.stale 一致
+    assert r.headers["X-Data-Stale"] == "true" and "Warning" not in r.headers
+    assert r.headers["Cache-Control"] == "no-cache"
+
+
+def test_fresh_response_has_no_stale_header():
+    c, _ = client()
+    r = c.get(URL, params=OK)
+    assert r.json()["meta"]["stale"] is False and "X-Data-Stale" not in r.headers
+
+
+def test_cache_control_is_private():
+    """多租户：public 会让 CDN / 共享代理跨租户复用响应。max-age 分档不变。"""
+    c, _ = client()
+    sealed = c.get(URL, params=OK)                                                   # 全部已封口 → 24h 档
+    open_ = c.get(URL, params={"start_date": "2024-03-01", "end_date": "2024-03-20"})  # 含未封口日 → 60s 档
+    assert sealed.headers["Cache-Control"] == "private, max-age=3600"
+    assert open_.headers["Cache-Control"] == "private, max-age=30"
 
 
 def test_platform_order_hits_same_cache_key():

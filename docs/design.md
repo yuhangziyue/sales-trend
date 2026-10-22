@@ -49,7 +49,16 @@ DDL：[`sql/ddl/001_tables.sql`](../sql/ddl/001_tables.sql)。
 | 汇总维度 | **按商品，不按品类** | 品类口径会变，商品销量不会变；改规则不重算小时表 | 按品类：查询少一次 IN，但每次改规则全量重算 |
 | 分区 | **按月** | ClickHouse 建议分区值 100–1000 个，按月十年 120 个 | 按天：两年 730 个，合并不跨分区，易 Too many parts |
 
-排序键以 `product_id` 打头：查询总是「一组商品 × 一段时间」，稀疏主键能直接跳到这些商品的数据块。
+排序键以 `product_id` 打头：查询总是「一组商品 × 一段时间」，稀疏主键能直接跳到这些商品的数据块。**P5 实测的修正**：这只在品类商品成片聚集时成立。品类占 10% 且分散时，一个 granule（8192 行）横跨约 50 个商品，每个 granule 都含命中商品，一个也跳不过——一年区间的小时表查询就是全表扫描。另外「商品 × 小时」在稀疏数据下压不掉行数（1000 万事件汇总后 945 万行），省的只是字节。所以小时表段的成本随商品小时表总行数线性增长，见[压测报告](perf-report.md) P5。
+
+**FINAL 的取舍（O7，P5 实测，未改代码）**：三段查询都带 `FINAL`，用来兜底 Replacing 表里尚未合并的重复行。千万级下去掉 FINAL 结果完全一致，但成本差很大：小时表一年串行 P50 128 → 30 ms、8 并发 P99 1,248 → 298 ms、单查询内存 220 MB → 1 MB；明细 31 天 P50 50 → 11 ms；日表无差别。重复只会来自两种竞态：并发导入同一批数据（「查已有 key → 写入」不是原子的），以及两个重算任务重叠（「先删后写」是两条语句）。结论：
+
+| 位置 | 决定 |
+|---|---|
+| 重算 SQL 读 fact_sales | 保留 FINAL：每 5 分钟付一次，保证汇总建在去重后的明细上 |
+| 日表段 | 保留：成本为零 |
+| 小时表段 | 去掉，**前提是**重算改成写临时表后 `REPLACE PARTITION` 整分区原子替换、并由调度锁保证单写者。这同时消除了「删了还没写」的空窗，而那个空窗 FINAL 本来就防不了 |
+| 明细段 | 保留：区间上限 31 天，带 FINAL 也在目标内；并发导入的竞态只能靠它兜底 |
 
 ## 3 · 数据处理
 
@@ -192,11 +201,16 @@ GET /healthz · /readyz
 | 缓存击穿 | singleflight：同 key 并发未命中只放一个请求查库 |
 | 缓存穿透 | 品类列表进程内常驻，未知品类直接 404 不碰存储 |
 | 突发流量 | 按 API key 令牌桶（默认 50/s，突发 100） |
-| 存储挂了 | 查询超时 2 秒；连续失败熔断 30 秒；有旧缓存返回旧数据并标 `stale: true` + `Warning: 110`，没有则 503 / 504 |
+| 存储挂了 | 查询超时 2 秒；连续失败熔断 30 秒；有旧缓存返回旧数据并标 `meta.stale: true` + `X-Data-Stale: true` 响应头，没有则 503 / 504 |
 | Redis 挂了 | 缓存读写失败一律当未命中，直接查存储，不影响正确性 |
 | 客户端重复拉取 | `ETag` + `If-None-Match` → 304 |
+| 下游 HTTP 缓存 | `Cache-Control: private, max-age=3600 / 30`（按 TTL 档位），降级响应 `no-cache` |
 
 **降级取舍**：存储挂了时返回旧数据还是报错？返回旧数据并明确标记。看板场景下，一个标着「数据可能延迟」的图比报错页有用；标记保证调用方不会把旧数据当新数据。
+
+**旧数据怎么标**：以响应体 `meta.stale` 为准，另带 `X-Data-Stale: true` 响应头，方便网关和访问日志不解析 body 就能过滤。不用 `Warning: 110`：RFC 9111 已把 `Warning` 头整体废弃，浏览器和多数代理不再处理它。
+
+**为什么 `private` 不是 `public`**：响应按租户（`X-API-Key`）区分，`public` 允许 CDN 和共享代理缓存，第一个租户的响应会被原样返回给下一个租户。`private` 只允许调用方自己的浏览器缓存。**要上 CDN，必须二选一**：响应加 `Vary: X-API-Key`（CDN 按租户分别缓存，命中率随租户数下降），或把租户放进 URL（如 `/v1/tenants/{tenant}/...`，缓存 key 天然带租户）。在此之前保持 `private`。
 
 ### 7.1 容量假设与 SLO（生产）
 
@@ -209,7 +223,36 @@ GET /healthz · /readyz
 
 SLO：2000 QPS 下 P95 ≤ 80 ms、P99 ≤ 200 ms，缓存命中率 ≥ 90%，5xx < 0.1%。本机实测见[压测报告](perf-report.md)。
 
-### 7.2 扩展路线
+存储层分段目标（未命中时单段 SQL 的服务端 P99，千万级明细）：日表段一年 ≤ 150 ms，小时表段一年 ≤ 500 ms，明细段 31 天 ≤ 1500 ms。P5 实测日表段与明细段在 8 并发下都达标；小时表段串行达标、8 并发 1.2 s 未达标，原因与对策见 §2 与压测报告。
+
+### 7.2 可观测性：`/metrics`
+
+代码：[`metrics.py`](../src/salestrend/metrics.py)。`/metrics` 不走限流（抓取方被 429 等于监控失明），不进 OpenAPI。
+
+| 指标 | 类型 | 标签 | 记什么 |
+|---|---|---|---|
+| `trend_requests_total` | counter | `cache`=hit / miss / stale / none，`status` | 趋势接口请求数。503 / 504 记 miss（缓存未命中后存储失败）；参数错、限流、404 没走到缓存，记 none |
+| `trend_request_seconds` | histogram | `path`=cache_hit / class_daily / hourly / fact / mixed / stale / empty | 成功响应的耗时。多段计划记 mixed；empty = 区间全部晚于数据截止、不查库。桶 1ms–5s |
+| `storage_queries_total` | counter | `segment` | 每成功执行一段 SQL 加 1 |
+| `singleflight_shared_total` | counter | — | 被 singleflight 合并、等别人结果的请求数 |
+| `circuit_open` | gauge | — | 1 = 熔断中。多 worker 取最大值：任一 worker 熔断即为 1 |
+
+**多 worker**：uvicorn 起 2 个 worker，各是独立进程。不做处理时 `/metrics` 只返回恰好接到抓取请求的那个 worker 的数，命中率和总数都是错的。所以用 prometheus_client 多进程模式：Dockerfile 设 `PROMETHEUS_MULTIPROC_DIR` 并在启动时清空，每个 worker 把计数写进目录下按 pid 命名的文件，`/metrics` 用 `MultiProcessCollector` 汇总。实测：清空后打 300 个请求，两个 worker 各自记了 135 和 166（第 301 个是另一次 curl），`/metrics` 汇总为 300。
+
+**公式**（PromQL，5 分钟窗口）：
+
+```
+命中率 = sum(rate(trend_requests_total{cache="hit"}[5m]))
+       / sum(rate(trend_requests_total{cache=~"hit|miss|stale"}[5m]))
+回源率 = sum(rate(storage_queries_total[5m])) / sum(rate(trend_requests_total{cache!="none"}[5m]))
+```
+
+- 命中率的分母只含走到缓存的请求（hit + miss + stale），参数错之类不算。stale 计入分母、不计入分子：降级返回的是旧数据，不算命中。
+- 回源率按「SQL 段数 ÷ 请求数」算，一个混合计划算 2–3 次回源，所以它可以大于 1 − 命中率；被 singleflight 合并的请求记作 miss 却不产生回源，又会让它小于 1 − 命中率。两者的差值本身就是诊断信号。
+- **告警线**：命中率 < 85% 持续 10 分钟**预警**，< 70% **告警**（SLO 要求 ≥ 90%）。另配：`circuit_open == 1` 立即告警；`histogram_quantile(0.99, ...{path!="cache_hit"})` > 1s 预警。
+- 命中率高度依赖用户怎么选区间：看板预设区间（20 个热点 key）与任意区间差别很大，实测对照见[压测报告](perf-report.md) P6。
+
+### 7.3 扩展路线
 
 | 档 | 规模 | 变化 |
 |---|---|---|

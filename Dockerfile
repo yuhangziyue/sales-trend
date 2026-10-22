@@ -7,4 +7,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY . .
 RUN uv sync --frozen --no-dev
 EXPOSE 8000
-CMD ["uv", "run", "--no-dev", "uvicorn", "salestrend.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# 2 个 worker 各数各的：prometheus_client 多进程模式把各 worker 的计数写到这个目录，/metrics 汇总。
+# 启动时清空：上一次运行留下的文件会被当成「还活着的 worker」继续累加，计数从旧值起跳
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus-multiproc
+CMD ["sh", "-c", "rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\" && exec uv run --no-dev uvicorn salestrend.api.app:create_app --factory --host 0.0.0.0 --port 8000 --workers 2"]

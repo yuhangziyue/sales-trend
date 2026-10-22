@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 import uuid
 
 from fastapi import FastAPI, Query, Request, Response
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from ..cache.resilience import ResponseCache, TokenBucket
 from ..classify.rules import default_versions, load_rulesets
+from ..metrics import TREND_REQUESTS, TREND_SECONDS, render, trend_path
 from ..service import TrendService
 from ..settings import Settings, get_settings
 from .errors import Problem, problem_handler
@@ -66,6 +68,11 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
         body = {"clickhouse": ch, "redis": rd}
         return JSONResponse(body, status_code=200 if ch else 503)
 
+    @app.get("/metrics", include_in_schema=False)  # 不进 OpenAPI 业务部分；不走限流：抓取方被 429 等于监控失明
+    async def metrics():
+        body, content_type = render()
+        return Response(body, media_type=content_type)
+
     @app.get("/v1/product-classes", tags=["classes"])
     async def list_classes():
         return {"data": [{"class_slug": c, "default_rule_version": v, "rule_versions": _class(c),
@@ -97,6 +104,21 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
         granularity: str | None = Query(None, description="day | week | month，默认 day"),
         rule_version: str | None = Query(None, description="品类规则版本，默认当前版本"),
     ):
+        t0 = time.perf_counter()
+        try:
+            resp, meta = await _trend(request, class_slug, start_date, end_date, platforms, tz, granularity,
+                                      rule_version)
+        except Problem as e:
+            # 503 / 504 是缓存未命中后存储失败，算 miss（命中率分母要含它）；其余错误没走到缓存，记 none
+            cache = "miss" if e.code in ("UPSTREAM_UNAVAILABLE", "QUERY_TIMEOUT") else "none"
+            TREND_REQUESTS.labels(cache, str(e.status)).inc()
+            raise
+        TREND_REQUESTS.labels(meta["cache"], str(resp.status_code)).inc()
+        TREND_SECONDS.labels(trend_path(meta)).observe(time.perf_counter() - t0)
+        return resp
+
+    async def _trend(request: Request, class_slug, start_date, end_date, platforms, tz, granularity,
+                     rule_version) -> tuple[Response, dict]:
         api_key = request.headers.get("X-API-Key") or (request.client.host if request.client else "anon")
         if wait := bucket.take(api_key):
             raise Problem("RATE_LIMITED", "rate limit exceeded", headers={"Retry-After": str(max(1, round(wait)))})
@@ -114,15 +136,18 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
         body, ttl = await app.state.service.trend(p)
         payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         etag = '"' + hashlib.sha256(json.dumps(body["data"], sort_keys=True).encode()).hexdigest()[:20] + '"'
-        headers = {"ETag": etag, "Cache-Control": f"public, max-age={3600 if ttl >= 3600 else 30}",
+        # private：响应按租户（X-API-Key）区分，public 会让 CDN / 共享代理把一个租户的数据返回给另一个租户。
+        # 要上 CDN 就得加 Vary: X-API-Key 或把租户放进 URL，见 design.md §7
+        headers = {"ETag": etag, "Cache-Control": f"private, max-age={3600 if ttl >= 3600 else 30}",
                    "X-Cache": body["meta"]["cache"],
                    "X-Query-Plan": ",".join(f'{x["segment"]}:{x["from"]}..{x["to"]}' for x in body["meta"]["plan"])}
         if body["meta"]["stale"]:
-            headers["Warning"] = '110 - "Response is Stale"'
+            # 不用 Warning: 110：RFC 9111 已废弃 Warning 头。权威标记是 meta.stale，这个头只方便网关 / 日志过滤
+            headers["X-Data-Stale"] = "true"
             headers["Cache-Control"] = "no-cache"
         if request.headers.get("If-None-Match") == etag:
-            return Response(status_code=304, headers=headers)
-        return Response(payload, media_type="application/json", headers=headers)
+            return Response(status_code=304, headers=headers), body["meta"]
+        return Response(payload, media_type="application/json", headers=headers), body["meta"]
 
     return app
 

@@ -15,6 +15,8 @@ from typing import Any
 
 import redis.asyncio as aioredis
 
+from ..metrics import CIRCUIT_OPEN, SINGLEFLIGHT_SHARED
+
 log = logging.getLogger(__name__)
 
 STALE_TTL_S = 7 * 24 * 3600
@@ -73,6 +75,7 @@ class SingleFlight:
 
     async def do(self, key: str, fn: Callable[[], Awaitable[Any]]) -> Any:
         if key in self._inflight:
+            SINGLEFLIGHT_SHARED.inc()  # 被合并掉的请求：不查库，等第一个请求的结果
             return await asyncio.shield(self._inflight[key])
         fut = asyncio.get_running_loop().create_future()
         self._inflight[key] = fut
@@ -120,7 +123,9 @@ class CircuitBreaker:
 
     @property
     def is_open(self) -> bool:
-        return time.monotonic() < self.open_until
+        opened = time.monotonic() < self.open_until
+        CIRCUIT_OPEN.set(int(opened))  # 熔断到期自动关闭，没有事件可挂：每次判断时回写指标
+        return opened
 
     def success(self) -> None:
         self.failures = 0
@@ -130,3 +135,4 @@ class CircuitBreaker:
         if self.failures >= self.threshold:
             self.open_until = time.monotonic() + self.cooldown
             self.failures = 0
+            CIRCUIT_OPEN.set(1)

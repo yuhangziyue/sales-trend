@@ -13,6 +13,7 @@ import clickhouse_connect
 
 from .classify.rules import RuleSet, normalize
 from .ingest.pipeline import REJECT_FLAGS, Event, clean
+from .metrics import STORAGE_QUERIES
 from .query.planner import Plan, local_day_utc
 from .settings import ROOT, Settings
 
@@ -188,7 +189,9 @@ class Store:
                       "d1": seg.first, "d2": seg.last, "s": s, "e": e}
             sql = {"class_daily": "queries/trend_daily.sql", "hourly": "queries/trend_hourly.sql",
                    "fact": "queries/trend_fact.sql"}[seg.segment]
-            for local_date, source, sales in self.client.query(_sql(sql), parameters=params).result_rows:
+            rows = self.client.query(_sql(sql), parameters=params).result_rows
+            STORAGE_QUERIES.labels(seg.segment).inc()  # 回源率的分子：查成功一段记一段
+            for local_date, source, sales in rows:
                 if seg.first <= local_date <= seg.last:
                     out[(local_date, source)] += int(sales)
         return out

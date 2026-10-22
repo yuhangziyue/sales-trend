@@ -1,4 +1,4 @@
-.PHONY: up seed ingest rollup demo report test test-unit perf openapi down logs
+.PHONY: up seed ingest rollup demo report test test-unit perf perf-p5 perf-p6 openapi down logs
 
 API ?= http://localhost:8000
 RUN  := docker compose exec -T api uv run --no-dev salestrend
@@ -30,8 +30,15 @@ test:          ## 单元 + 集成（集成测试需要 make up && make seed）
 test-unit:
 	uv run pytest -q tests/unit
 
-perf:          ## k6 固定到达率压测
+perf:          ## k6 固定到达率压测（P1–P4、P6）
 	bash perf/run.sh $(API)
+
+perf-p5:       ## 千万级实测：独立库 p5 合成 1000 万行，测存储、重算、三段查询；测完 DROP（KEEP=1 保留）
+	uv run python perf/p5.py $(if $(KEEP),--keep,)
+	uv run python perf/report.py perf/results docs/perf-report.md
+
+perf-p6:       ## 只跑 P6 任意区间命中率（含 20 热点 key 对照）
+	SCENS=range bash perf/run.sh $(API)
 
 down:
 	docker compose down -v
