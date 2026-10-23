@@ -10,7 +10,7 @@ from .errors import param_error
 
 GRANULARITIES = ("day", "week", "month")
 # 响应结构版本：加字段后递增。否则上线后、下一次回填前，旧结构的缓存还会按 24 小时 TTL 继续返回
-RESPONSE_SCHEMA = "r2"
+RESPONSE_SCHEMA = "r3"  # r3：meta.plan 每段加 utc_from / utc_to
 _IANA = available_timezones() | {"UTC"}
 
 

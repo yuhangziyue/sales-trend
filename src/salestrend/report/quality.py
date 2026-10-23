@@ -28,7 +28,13 @@ def _md_table(head: list[str], rows: list[list]) -> str:
     return "\n".join(out)
 
 
-def build_report(events: list[Event], rulesets: dict[tuple[str, str], RuleSet], source_file: str) -> str:
+def build_report(events: list[Event], rulesets: dict[tuple[str, str], RuleSet], source_file: str,
+                 confirmed: dict[str, bool] | None = None) -> str:
+    """confirmed：平台 → 源时区是否已与采集方确认；不传时读 config/platforms.yaml。"""
+    if confirmed is None:
+        from ..settings import get_settings
+
+        confirmed = get_settings().source_tz_confirmed
     good = clean(events)
     rejected = [e for e in events if e.rejected]
     dups = [e for e in events if e.is_duplicate]
@@ -101,6 +107,8 @@ def build_report(events: list[Event], rulesets: dict[tuple[str, str], RuleSet], 
             "",
         ]
 
+    sources = sorted({e.source for e in good})
+    unconfirmed = [s for s in sources if not confirmed.get(s, False)]
     sh = ZoneInfo("Asia/Shanghai")
     boundary = [e for e in good if "day_boundary" in e.dq_flags]
     parts += [
@@ -118,11 +126,12 @@ def build_report(events: list[Event], rulesets: dict[tuple[str, str], RuleSet], 
         "",
         "## 8 · 各平台数据截止时间",
         "",
-        _md_table(["平台", "源时区", "最新事件（UTC）", "行数"], [
+        _md_table(["平台", "源时区", "已与采集方确认", "最新事件（UTC）", "行数"], [
             [src, next(e.source_tz for e in good if e.source == src),
+             "是" if confirmed.get(src, False) else "**否**（假设）",
              max(e.event_ts for e in good if e.source == src).strftime("%Y-%m-%d %H:%M"),
              sum(1 for e in good if e.source == src)]
-            for src in sorted({e.source for e in good})]),
+            for src in sources]),
         "",
         "数据只到 2024-03-13：之后的日期 API 返回 `null`（还没数据），与 `0`（没卖出去）区分。",
         "",
@@ -132,8 +141,14 @@ def build_report(events: list[Event], rulesets: dict[tuple[str, str], RuleSet], 
         "",
         "## 9 · 时区假设",
         "",
-        "timestamp 不带时区。本数据三个平台默认都按 UTC 解析（`config/platforms.yaml`）。但小时分布集中在 07–22 点，"
-        "更像本地营业时间：**生产环境必须与采集方确认**。改配置后重放 ingest 即可，raw 表保留了原始时间文本。",
+        "timestamp 不带时区，源时区按平台登记在 `config/platforms.yaml`（`source_tz` + `confirmed`）。",
+        "",
+        (f"未确认的平台：{'、'.join(f'`{s}`' for s in unconfirmed)}（共 {len(unconfirmed)}/{len(sources)} 个）。"
+         "当前 source_tz 是我们的假设：小时分布集中在 07–22 点，更像本地营业时间，**生产环境必须与采集方确认**。"
+         "查询时只要请求 tz 与未确认的 source_tz 不同，响应 meta.warnings 会带 `SOURCE_TZ_UNCONFIRMED`。"
+         if unconfirmed else "全部平台的源时区均已与采集方确认。"),
+        "",
+        "确认后改配置（`confirmed: true`）并重放 ingest 即可，raw 表保留了原始时间文本 ts_raw。",
         "",
     ]
     return "\n".join(parts)

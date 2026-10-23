@@ -110,6 +110,22 @@ def test_rate_limited():
     assert r.json()["code"] == "RATE_LIMITED" and int(r.headers["Retry-After"]) >= 1
 
 
+@pytest.mark.parametrize("tz,first", [
+    ("Asia/Kathmandu", "class_15m"),    # +05:45：v1.2.0 整段扫明细、本次一度限 31 天；15 分钟品类表后不再需要
+    ("Europe/Berlin", "class_15m"),
+    ("Asia/Kolkata", "class_daily"),    # 半点但已预设，读日表
+])
+def test_full_year_any_tz_reads_aggregates(tz, first):
+    c, _ = client()
+    r = c.get(URL, params={"start_date": "2023-03-14", "end_date": "2024-03-13", "tz": tz})
+    assert r.status_code == 200, r.text
+    plan = r.json()["meta"]["plan"]
+    assert plan[0]["segment"] == first
+    # 明细只服务封口线之后的尾巴：每段都回显精确的 UTC 区间
+    assert plan[-1]["segment"] == "fact" and plan[-1]["utc_from"] == "2024-03-13T09:00:00Z"
+    assert all(set(s) == {"segment", "table", "from", "to", "utc_from", "utc_to"} for s in plan)
+
+
 def test_upstream_unavailable_without_stale_cache():
     c, _ = client(store=FakeStore(fail=ConnectionError("down")))
     r = c.get(URL, params=OK)
@@ -166,7 +182,7 @@ def test_null_vs_zero_and_partial_dates():
     assert r["data"]["dates"] == ["2024-03-12", "2024-03-13", "2024-03-14", "2024-03-15"]
     assert r["data"]["total"][2:] == [None, None]
     assert r["meta"]["partial_dates"] == ["2024-03-13"]
-    assert [s["segment"] for s in r["meta"]["plan"]] == ["class_daily", "fact"]
+    assert [s["segment"] for s in r["meta"]["plan"]] == ["class_daily", "class_15m", "fact"]
 
 
 def test_week_granularity_buckets():

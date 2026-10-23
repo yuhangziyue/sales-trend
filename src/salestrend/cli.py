@@ -49,7 +49,8 @@ def cmd_rollup() -> None:
     s = get_settings()
     r = _store().rollup(load_rulesets(s.rules_dir))
     print(f"rollup: sealed_until {r['sealed_until']:%Y-%m-%d %H:%M}Z · data_through {r['data_through']:%Y-%m-%d %H:%M}Z"
-          f" · class_daily jobs {r['class_daily_jobs']} · version {r['version']}")
+          f" · class_15m jobs {r['class_15m_jobs']} · class_daily jobs {r['class_daily_jobs']}"
+          f" · version {r['version']}")
 
 
 def _bump_data_gen() -> None:

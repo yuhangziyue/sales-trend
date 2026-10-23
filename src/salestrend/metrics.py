@@ -25,14 +25,14 @@ from prometheus_client import (
     multiprocess,
 )
 
-# 1ms 到 5s：缓存命中在 1–3ms，日表段几十毫秒，明细段可到秒级，超时线 2s
+# 1ms 到 5s：缓存命中在 1–3ms，汇总段几毫秒到几十毫秒，明细段可到秒级，超时线 2s
 LATENCY_BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 
 TREND_REQUESTS = Counter(
     "trend_requests_total", "趋势接口请求数。cache=hit|miss|stale；none = 没走到缓存（参数错、限流、404）",
     ["cache", "status"])
 TREND_SECONDS = Histogram(
-    "trend_request_seconds", "趋势接口耗时（成功响应）。path=cache_hit|stale|class_daily|hourly|fact|mixed|empty",
+    "trend_request_seconds", "趋势接口耗时（成功响应）。path=cache_hit|stale|class_daily|class_15m|fact|mixed|empty",
     ["path"], buckets=LATENCY_BUCKETS)
 STORAGE_QUERIES = Counter("storage_queries_total", "实际执行的分段 SQL 数，每段一次", ["segment"])
 SINGLEFLIGHT_SHARED = Counter("singleflight_shared_total", "被 singleflight 合并、等别人结果的请求数")

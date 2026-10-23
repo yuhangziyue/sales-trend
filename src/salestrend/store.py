@@ -1,4 +1,4 @@
-"""ClickHouse 访问层：建表、写入、汇总重算、水位、三段查询。"""
+"""ClickHouse 访问层：建表、写入、汇总重算、水位、三段查询（另有一条只供对拍的商品小时表路径）。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import clickhouse_connect
 from .classify.rules import RuleSet, normalize
 from .ingest.pipeline import REJECT_FLAGS, Event, clean
 from .metrics import STORAGE_QUERIES
-from .query.planner import Plan, local_day_utc
+from .query.planner import Plan, floor_bucket, local_day_utc
 from .settings import ROOT, Settings
 
 SQL = ROOT / "sql"
@@ -48,7 +48,8 @@ class Store:
     # ---------- 建表 ----------
     def reset(self) -> None:
         for t in ("raw_sales_events", "fact_sales", "dim_product", "product_class_member",
-                  "agg_product_hourly", "agg_class_daily", "pipeline_state"):
+                  "agg_product_15m", "agg_class_15m", "agg_class_daily", "pipeline_state",
+                  "agg_product_hourly", "agg_class_hourly"):  # 后两张是旧版本的小时表，升级后一并清掉
             self.client.command(f"DROP TABLE IF EXISTS {t}")
         self.migrate()
 
@@ -134,15 +135,24 @@ class Store:
 
     # ---------- 汇总重算 ----------
     def rollup(self, rulesets: dict[tuple[str, str], RuleSet], now: datetime | None = None) -> dict:
-        """sealed_until = 当前时刻向下取整点。演示数据是历史数据，用「数据最新时间」模拟当前时刻。"""
+        """sealed_until = 当前时刻向下取到 15 分钟格。演示数据是历史数据，用「数据最新时间」模拟当前时刻。
+
+        按 15 分钟而不是整点对齐：品类表就是 15 分钟粒度，封口线落在格上，未封口那天的明细尾巴最短
+        （至多 15 分钟 + 一个重算间隔）。代价是零：重算区间本来就是 [start, sealed) 整段先删后写。
+        """
         lo, through = self.client.query("SELECT min(event_ts), max(event_ts) FROM fact_sales").result_rows[0]
         through, lo = _utc(through), _utc(lo)
         now = now or through
-        sealed = now.replace(minute=0, second=0, microsecond=0)
+        sealed = floor_bucket(now)
         version = int(_time.time() * 1000)
 
-        start = lo.replace(minute=0, second=0, microsecond=0)
-        self._run(SQL / "rollup" / "hourly.sql", {"from": start, "to": sealed, "version": version})
+        start = floor_bucket(lo)
+        self._run(SQL / "rollup" / "product_15m.sql", {"from": start, "to": sealed, "version": version})
+        # 品类 15 分钟表接在商品层之后、从它汇总：每个已加载的规则版本都物化（一个版本一年至多 10.5 万行），
+        # 规划器就不用区分「这个版本有没有品类表」。改规则只需重算成员表和这一步，商品层与明细不动
+        for (cls, rv) in rulesets:
+            self._run(SQL / "rollup" / "class_15m.sql", {
+                "cls": cls, "rv": rv, "from": start, "to": sealed, "version": version})
 
         daily = 0
         for (cls, rv) in rulesets:
@@ -162,7 +172,8 @@ class Store:
         self.set_state({"sealed_until": sealed, "data_through": through, **{
             f"data_through:{src}": _utc(ts) for src, ts in self.client.query(
                 "SELECT source, max(event_ts) FROM fact_sales GROUP BY source").result_rows}})
-        return {"sealed_until": sealed, "data_through": through, "class_daily_jobs": daily, "version": version}
+        return {"sealed_until": sealed, "data_through": through, "class_15m_jobs": len(rulesets),
+                "class_daily_jobs": daily, "version": version}
 
     def _run(self, path: Path, params: dict) -> None:
         for stmt in _statements(path):
@@ -181,14 +192,13 @@ class Store:
     # ---------- 查询 ----------
     def run_plan(self, plan: Plan, cls: str, rv: str, tz_name: str,
                  platforms: list[str]) -> dict[tuple[date, str], int]:
-        tz = ZoneInfo(tz_name)
         out: dict[tuple[date, str], int] = defaultdict(int)
         for seg in plan.segments:
-            s, e = seg.utc_range(tz)
             params = {"cls": cls, "rv": rv, "tz": tz_name, "platforms": platforms,
-                      "d1": seg.first, "d2": seg.last, "s": s, "e": e}
-            sql = {"class_daily": "queries/trend_daily.sql", "hourly": "queries/trend_hourly.sql",
-                   "fact": "queries/trend_fact.sql"}[seg.segment]
+                      "d1": seg.first, "d2": seg.last, "s": seg.utc_from, "e": seg.utc_to}
+            sql = {"class_daily": "queries/trend_daily.sql", "class_15m": "queries/trend_class_15m.sql",
+                   "fact": "queries/trend_fact.sql",
+                   "product_15m": "queries/trend_product_15m.sql"}[seg.segment]
             rows = self.client.query(_sql(sql), parameters=params).result_rows
             STORAGE_QUERIES.labels(seg.segment).inc()  # 回源率的分子：查成功一段记一段
             for local_date, source, sales in rows:

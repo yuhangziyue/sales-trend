@@ -1,6 +1,8 @@
-.PHONY: up seed ingest rollup demo report test test-unit perf perf-p5 perf-p6 openapi down logs
+.PHONY: up seed ingest rollup demo report test test-unit perf perf-p5 perf-p6 capacity openapi down logs
 
-API ?= http://localhost:8000
+# 宿主机端口与 docker-compose.yml 同一组环境变量：改了 API_HOST_PORT，make demo / perf 自动跟上
+API_HOST_PORT ?= 8000
+API ?= http://localhost:$(API_HOST_PORT)
 RUN  := docker compose exec -T api uv run --no-dev salestrend
 
 up:            ## 起 ClickHouse、Redis、API 三个容器
@@ -35,6 +37,10 @@ perf:          ## k6 固定到达率压测（P1–P4、P6）
 
 perf-p5:       ## 千万级实测：独立库 p5 合成 1000 万行，测存储、重算、三段查询；测完 DROP（KEEP=1 保留）
 	uv run python perf/p5.py $(if $(KEEP),--keep,)
+	uv run python perf/report.py perf/results docs/perf-report.md
+
+capacity:      ## 容量：缓存命中路径逐档加压找拐点，对照 2 / 4 个 API worker（P5 库上的未命中拐点见 perf-p5）
+	uv run python perf/capacity.py
 	uv run python perf/report.py perf/results docs/perf-report.md
 
 perf-p6:       ## 只跑 P6 任意区间命中率（含 20 热点 key 对照）

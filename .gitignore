@@ -4,3 +4,7 @@ __pycache__/
 .ruff_cache/
 .env
 perf/results/
+
+# 本机工具与系统文件
+.claude/
+.DS_Store

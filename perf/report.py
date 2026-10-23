@@ -27,8 +27,22 @@ def sh(cmd: str) -> str:
 
 
 MARKER = "## 结论与解读"
-SLO_P5 = {"class_daily": ("日表段 · 一年 · UTC（预设）", 150), "hourly": ("小时表段 · 一年 · Europe/Berlin", 500),
-          "fact": ("明细段 · 31 天 · Asia/Kathmandu", 1500)}
+# 存储层分段目标（单段 SQL 服务端 P99），商品小时表段沿用 v1.2.0 的 B 段目标作对照
+SLO_P5 = {"class_daily": ("日表段 · 一年 · UTC（预设）", 150),
+          "class_15m": ("品类 15 分钟表段 · 一年 · Europe/Berlin", 500),
+          "class_15m_ktm": ("品类 15 分钟表段 · 一年 · Asia/Kathmandu", 500),
+          "product_15m": ("商品 15 分钟表段（对照，不在查询路径） · 一年 · Europe/Berlin", 500),
+          "fact": ("明细段 · 31 天 · Asia/Kathmandu（优化前该时区只能整段扫明细）", 1500),
+          "fact_day": ("明细段 · 实时优化前 · 未封口的一整天（UTC 12-31）", 150),
+          "fact_tail": ("明细段 · 实时优化后 · 封口线之后的尾巴（12:00–24:00）", 150)}
+PHASES = {"rollup": "重算后", "optimized": "OPTIMIZE 后"}
+# 端到端目标（缓存未命中）：已聚合 50–100 ms，含当天实时 ≤ 150 ms。场景名与 perf/p5.py 的 E2E 一致
+E2E = {"agg_hourly": ("已聚合 · 一年 · Europe/Berlin → 品类 15 分钟表段", 100),
+       "agg_kathmandu": ("已聚合 · 一年 · Asia/Kathmandu → 品类 15 分钟表段", 100),
+       "agg_daily": ("已聚合 · 一年 · UTC → 日表段", 100),
+       "rt_utc": ("实时 · 近 30 天 · UTC → 日表 + 当天前半天 15 分钟表 + 尾巴明细", 150),
+       "rt_berlin": ("实时 · 近 30 天 · Europe/Berlin → 15 分钟表 + 尾巴明细", 150),
+       "rt_kathmandu": ("实时 · 近 30 天 · Asia/Kathmandu → 15 分钟表 + 尾巴明细", 150)}
 
 
 def mb(n) -> str:
@@ -37,7 +51,55 @@ def mb(n) -> str:
 
 
 def fmt_ms(x) -> str:
-    return f"{float(x):.0f}" if float(x) >= 10 else f"{float(x):.1f}"
+    return f"{float(x or 0):.0f}" if float(x or 0) >= 10 else f"{float(x or 0):.1f}"
+
+
+def load_runs(results: Path, prefix: str) -> dict[str, list[tuple[int, dict]]]:
+    """{场景: [(到达率, k6 metrics + 可选的 _cpu)]}。文件名 {prefix}{场景}_r{到达率}.json，旁边可有 .cpu.json。"""
+    out: dict[str, list[tuple[int, dict]]] = {}
+    for f in results.glob(f"{prefix}*_r*.json"):
+        if f.name.endswith(".cpu.json"):
+            continue
+        scen, rate = f.stem.removeprefix(prefix).rsplit("_r", 1)
+        m = json.loads(f.read_text())["metrics"]
+        cpu = f.with_suffix(".cpu.json")
+        if cpu.exists():
+            m["_cpu"] = json.loads(cpu.read_text())
+        out.setdefault(scen, []).append((int(rate), m))
+    return {k: sorted(v, key=lambda x: x[0]) for k, v in out.items()}
+
+
+def e2e_rows(results: Path) -> dict[str, list[tuple[int, dict]]]:
+    return load_runs(results, "p5_e2e_")
+
+
+def cpu_cols(m: dict) -> str:
+    """API / ClickHouse / k6 的 CPU%（1 核 = 100%，虚拟机 4 vCPU 上限约 400%）。"""
+    c = m.get("_cpu")
+    if not c:
+        return "— | — | —"
+    api = sum(v for k, v in c.items() if "api" in k and v)
+    ch = sum(v for k, v in c.items() if "clickhouse" in k and v)
+    return f"{api:.0f}% | {ch:.0f}% | {c.get('k6(host)') or 0:.0f}%"
+
+
+def capacity_section(results: Path) -> list[str]:
+    runs = load_runs(results, "capacity_hit_")
+    if not runs:
+        return []
+    lines = ["## 容量：缓存命中路径的单机拐点", "",
+             "`make capacity`：样例库，20 个热点 key 预热后全部命中，k6 固定到达率每档 30 s，逐档加压直到 P99 超过 "
+             "40 ms（目标 20 ms 的 2 倍）或失败率超过 1%。每个 worker 数各重建一次 api 容器。CPU 列为采样平均，"
+             "1 核 = 100%：API / ClickHouse 在 4 vCPU 虚拟机里（上限约 400%），k6 在宿主机上。", "",
+             "| API worker | 到达率 | 实际 RPS | P50 ms | P99 ms | 失败率 | 目标 P99 ≤ 20 | API CPU | ClickHouse CPU | k6 CPU |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for w, pts in sorted(runs.items()):
+        for rate, m in pts:
+            d, f = m["http_req_duration"], m["http_req_failed"]["value"]
+            ok = d["p(99)"] <= 20 and f < 0.001
+            lines.append(f"| {w.removeprefix('w')} | {rate} | {m['http_reqs']['rate']:.0f} | {d['med']:.1f} | "
+                         f"{d['p(99)']:.1f} | {f * 100:.2f}% | {'✅' if ok else '❌'} | {cpu_cols(m)} |")
+    return [*lines, ""]
 
 
 def p5_section(results: Path) -> list[str]:
@@ -45,56 +107,95 @@ def p5_section(results: Path) -> list[str]:
     if not f.exists():
         return ["## P5 千万级实测", "", "未运行（`make perf-p5`）。", ""]
     r = json.loads(f.read_text())
+    phases = {k: v for k, v in r["phases"].items() if k in PHASES}
     lines = ["## P5 千万级实测", "",
              f"`make perf-p5`：同一个 ClickHouse 里建独立库 `{r['db']}`（同一份 DDL），"
              f"`INSERT … SELECT … FROM numbers({r['rows_requested']:,})` 合成明细：5000 个商品 × 3 个平台，"
-             "2024 全年每天 07:00–22:59 均匀分布，销量 1–18；成员表规则版本 `p5` 下 match 500 个商品（每 10 个取 1 个）。"
-             "延迟一律取 `system.query_log` 的服务端耗时。", "",
-             "### 存储量（system.parts，active parts）", "",
-             "| 表 | 行数 | 压缩前 | 压缩后 | 压缩比 | parts |", "|---|---|---|---|---|---|"]
-    for t in r["storage"]:
-        lines.append(f"| {t['table']} | {int(t['rows']):,} | {mb(t['raw_bytes'])} | {mb(t['bytes'])} | "
-                     f"{t['ratio']} | {t['parts']} |")
+             "2024 全年每天 07:00–22:59 均匀分布，销量 1–18；成员表规则版本 `v1` 下 match 500 个商品（每 10 个取 1 个）。"
+             "SQL 层延迟一律取 `system.query_log` 的服务端耗时。测量分两组：**重算后**（等后台合并停下就测，"
+             "与 v1.2.0 的 P5 同一状态）与 **OPTIMIZE 后**（全部表 `OPTIMIZE … FINAL`，每个月分区压成 1 个 part）。", "",
+             "### 存储量与 part 数（system.parts，active parts）", "",
+             "| 表 | 行数 | 压缩前 | 压缩后 | 压缩比 | 分区 | " + " | ".join(f"parts（{PHASES[k]}）" for k in phases) + " |",
+             "|" + "---|" * (6 + len(phases))]
+    first = next(iter(phases.values()))["storage"]
+    parts = {k: {t["table"]: t["parts"] for t in v["storage"]} for k, v in phases.items()}
+    for t in first:
+        lines.append(f"| {t['table']} | {int(t['rows']):,} | {mb(t['raw_bytes'])} | {mb(t['bytes'])} | {t['ratio']} | "
+                     f"{t.get('partitions', '?')} | " + " | ".join(str(parts[k].get(t["table"], "?")) for k in phases) + " |")
     if "load" in r:
         lines += ["", "### 写入与重算耗时", "", "| 步骤 | 服务端耗时 | 写入行数 |", "|---|---|---|",
                   f"| 合成明细 + 成员表 | {r['load']['server_ms'] / 1000:.1f} s | {r['load']['written_rows']:,} |",
-                  f"| 小时表重算（全年，先删后写） | {r['rollup_hourly']['server_ms'] / 1000:.1f} s | "
-                  f"{r['rollup_hourly']['written_rows']:,} |"]
+                  f"| 商品 15 分钟表重算（全年，从明细，先删后写） | {r['rollup_product']['server_ms'] / 1000:.1f} s | "
+                  f"{r['rollup_product']['written_rows']:,} |"]
+        if "rollup_class_15m" in r:
+            v = r["rollup_class_15m"]
+            lines.append(f"| 品类 15 分钟表重算（全年，从商品层，一个规则版本） | {v['server_ms'] / 1000:.2f} s | "
+                         f"{v['written_rows']:,} |")
         for tz, v in r["rollup_daily"].items():
-            lines.append(f"| 品类日表重算 · {tz}（全年） | {v['server_ms'] / 1000:.2f} s | {v['written_rows']:,} |")
-    lines += ["", "### 三段查询（串行 = 同一条 SQL 连跑 N 次；8 并发 = clickhouse-benchmark -c 8）", "",
-              "| 段 | FINAL | 串行 n | 串行 P50 / P95 / P99 ms | 8 并发 P50 / P95 / P99 ms | 8 并发 QPS | read_rows | "
-              "read_bytes | 峰值内存 | 目标 P99 |",
-              "|" + "---|" * 10]
-    for name, q in r["queries"].items():
-        label, target = SLO_P5[name]
-        for k, lab in (("final", "有"), ("nofinal", "去掉")):
-            se, c8 = q[f"{k}_serial"], q[f"{k}_c8"]
-            ok = ("✅" if se["p99"] <= target else "❌") + " / " + ("✅" if c8["p99"] <= target else "❌")
-            lines.append(
-                f"| {label} | {lab} | {se['n']} | {fmt_ms(se['p50'])} / {fmt_ms(se['p95'])} / {fmt_ms(se['p99'])} | "
-                f"{fmt_ms(c8['p50'])} / {fmt_ms(c8['p95'])} / {fmt_ms(c8['p99'])} | {c8['qps'] or 0:.1f} | "
-                f"{se['read_rows']:,} | {mb(se['read_bytes'])} | {mb(se['memory'])} | ≤ {target}（串行 / 并发 {ok}） |")
-    lines += ["", "去掉 FINAL 前先比对了结果：" + "；".join(
-        f"{SLO_P5[n][0].split(' · ')[0]} {'一致' if q['same_result'] else '**不一致**'}" for n, q in r["queries"].items())
-        + "。", "", "### 并发拐点（带 FINAL 的主路径）", "",
-        "| 段 | 并发 | 成功 / 失败 | P50 ms | P99 ms | QPS |", "|---|---|---|---|---|---|"]
-    for name, q in r["queries"].items():
-        pts = sorted([*q["curve"], q["final_c8"]], key=lambda x: x["conc"])
-        for c in pts:
-            err = c.get("errors", 0)
-            fail = f"{err}（code {c['error_code']}）" if err else "0"
-            lines.append(f"| {SLO_P5[name][0].split(' · ')[0]} | {c['conc']} | {c['n']} / {fail} | "
-                         f"{fmt_ms(c['p50'] or 0)} | {fmt_ms(c['p99'] or 0)} | {c['qps'] or 0:.1f} |")
-    e2e = sorted(results.glob("p5_e2e_r*.json"), key=lambda f: int(f.stem.split("_r")[-1]))
+            lines.append(f"| 品类日表重算 · {tz}（全年，从明细） | {v['server_ms'] / 1000:.2f} s | {v['written_rows']:,} |")
+        for t, v in r.get("optimize", {}).items():
+            lines.append(f"| OPTIMIZE TABLE {t} FINAL | {v['server_ms'] / 1000:.2f} s | — |")
+    lines += ["", "### 各段查询 × 两组（串行 = 同一条 SQL 连跑 N 次；并发 = clickhouse-benchmark -c 8 / -c 16）", "",
+              "| 段 | 组 | FINAL | 串行 P50 / P99 ms | 8 并发 P50 / P99 ms | 8 并发 QPS | 16 并发 P50 / P99 ms | "
+              "16 并发 QPS | 16 并发失败 | read_rows | 峰值内存 | 目标 P99（串行 / 8 / 16） |",
+              "|" + "---|" * 12]
+    for name, (label, target) in SLO_P5.items():
+        for ph, pv in phases.items():
+            q = pv["queries"].get(name)
+            if not q:
+                continue
+            for k, lab in (("final", "有"), ("nofinal", "去掉")):
+                se, c8, c16 = q[f"{k}_serial"], q[f"{k}_c8"], q.get(f"{k}_c16") or {}
+                ok = " / ".join("✅" if (x.get("p99") or 1e9) <= target else "❌" for x in (se, c8, c16))
+                err = f"{c16['errors']}（code {c16['error_code']}）" if c16.get("errors") else "0"
+                lines.append(
+                    f"| {label} | {PHASES[ph]} | {lab} | {fmt_ms(se['p50'])} / {fmt_ms(se['p99'])} | "
+                    f"{fmt_ms(c8['p50'])} / {fmt_ms(c8['p99'])} | {c8['qps'] or 0:.1f} | "
+                    f"{fmt_ms(c16.get('p50'))} / {fmt_ms(c16.get('p99'))} | {c16.get('qps') or 0:.1f} | {err} | "
+                    f"{se['read_rows']:,} | {mb(se['memory'])} | ≤ {target}（{ok}） |")
+    lines += ["", "结果核对（`sum(sales), 行数`，各组带 / 不带 FINAL 是否一致）："]
+    for ph, pv in phases.items():
+        lines.append(f"- {PHASES[ph]}：" + "；".join(
+            f"{n} `{q['result']}` {'一致' if q['same_result'] else '**不一致**'}" for n, q in pv["queries"].items()))
+    e2e = e2e_rows(results)
     if e2e:
-        lines += ["", "### 端到端（指向 p5 库的 API 实例，k6 固定到达率 60s，缓存旁路，一年区间 Europe/Berlin 小时表段）", "",
-                  "| 到达率 | 请求数 | P50 ms | P95 ms | P99 ms | 失败率 | 目标 P99 ≤ 500 |", "|---|---|---|---|---|---|---|"]
-        for f in e2e:
-            m = json.loads(f.read_text())["metrics"]
-            d, reqs, failed = m["http_req_duration"], m["http_reqs"], m["http_req_failed"]
-            lines.append(f"| {f.stem.split('_r')[-1]} RPS | {reqs['count']} | {d['med']:.0f} | {d['p(95)']:.0f} | "
-                         f"{d['p(99)']:.0f} | {failed['value'] * 100:.2f}% | {'✅' if d['p(99)'] <= 500 else '❌'} |")
+        lines += ["", "### 端到端：对照延迟目标（指向 p5 库的 API 实例，k6 固定到达率每档 60s，缓存全部未命中）", "",
+                  "目标：已聚合的数据 P99 ≤ 100 ms（50–100 ms 以内），含当天实时数据 P99 ≤ 150 ms。"
+                  "API 2 个 uvicorn worker；ClickHouse 与 API 跑在同一台 4 vCPU 虚拟机里，k6 在同一台宿主机上发压。"
+                  "某档 P99 超过目标的 2 倍或失败率超过 1% 后，更高的档不再跑。CPU 列为该档采样平均（1 核 = 100%，"
+                  "API / ClickHouse 在 4 vCPU 虚拟机里，上限约 400%；k6 在宿主机上）。", "",
+                  "| 场景 | 到达率 | 请求数 | P50 ms | P95 ms | P99 ms | 失败率 | 目标 P99 | 达标 | API CPU | ClickHouse CPU | k6 CPU |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        best = {}
+        for scen, (label, target) in E2E.items():
+            for rate, m in e2e.get(scen, []):
+                d, reqs, failed = m["http_req_duration"], m["http_reqs"], m["http_req_failed"]
+                ok = d["p(99)"] <= target and failed["value"] < 0.001
+                if ok:
+                    best[scen] = max(best.get(scen, 0), rate)
+                lines.append(f"| {label} | {rate} RPS | {reqs['count']} | {d['med']:.0f} | {d['p(95)']:.0f} | "
+                             f"{d['p(99)']:.0f} | {failed['value'] * 100:.2f}% | ≤ {target} | {'✅' if ok else '❌'} | "
+                             f"{cpu_cols(m)} |")
+        before = e2e_rows(results / "before")
+        if before:
+            lines += ["", "#### 实时路径优化前后（同样的到达率；优化前 = 未封口的一整天读明细，"
+                      "Kathmandu 整段读明细；优化后 = 只有封口线之后的尾巴读明细、明细按 event_ts 打头）", "",
+                      "| 场景 | 到达率 | 优化前 P50 / P95 / P99 ms | 优化前失败率 | 优化后 P50 / P95 / P99 ms | 优化后失败率 |",
+                      "|---|---|---|---|---|---|"]
+            for scen in ("rt_utc", "rt_berlin", "rt_kathmandu"):
+                after = dict(e2e.get(scen, []))
+                for rate, m in before.get(scen, []):
+                    b = m["http_req_duration"]
+                    a = after.get(rate)
+                    ad = a["http_req_duration"] if a else None
+                    lines.append(
+                        f"| {E2E[scen][0].split(' → ')[0]} | {rate} RPS | {b['med']:.0f} / {b['p(95)']:.0f} / "
+                        f"{b['p(99)']:.0f} | {m['http_req_failed']['value'] * 100:.2f}% | "
+                        + (f"{ad['med']:.0f} / {ad['p(95)']:.0f} / {ad['p(99)']:.0f} | "
+                           f"{a['http_req_failed']['value'] * 100:.2f}% |" if a else "未测 | — |"))
+        lines += ["", "仍满足目标的最高到达率（所测档位内）：" + "；".join(
+            f"{E2E[s][0].split(' → ')[0]} **{best[s]} RPS**" if s in best else f"{E2E[s][0].split(' → ')[0]} **无**"
+            for s in E2E if s in e2e) + "。"]
     return [*lines, ""]
 
 
@@ -149,7 +250,7 @@ def p6_stats(results: Path, scen: str) -> dict | None:
     xc = {c: m.get(f"xcache_{c}", {}).get("count", 0) for c in ("hit", "miss", "stale")}
     return {"cache": cache, "served": served, "hit_rate": cache["hit"] / served if served else 0,
             "storage": storage, "storage_by_seg": {s: total("storage_queries_total", segment=s)
-                                                   for s in ("class_daily", "hourly", "fact")},
+                                                   for s in ("class_daily", "hourly", "class_15m", "fact")},
             "backsource": storage / served if served else 0, "shared": total("singleflight_shared_total"),
             "paths": paths, "k6_reqs": m["http_reqs"]["count"], "k6_xc": xc,
             "k6_dur": m["http_req_duration"], "k6_failed": m["http_req_failed"]["value"]}
@@ -246,6 +347,7 @@ def main(results: Path, out: Path) -> None:
         "",
         *p5_section(results),
         *p6_section(results),
+        *capacity_section(results),
         *(manual or [MARKER, "", "（手写分析放在这里，重新生成时保留。）", ""]),
     ]))
     print(f"wrote {out}")

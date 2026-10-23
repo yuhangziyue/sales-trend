@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from prometheus_client import REGISTRY, CollectorRegistry
 from prometheus_client.multiprocess import MultiProcessCollector
@@ -15,7 +16,7 @@ from test_api import OK, URL, FakeCache, FakeStore, client  # tests/unit 不是�
 
 from salestrend.cache.resilience import CircuitBreaker
 from salestrend.metrics import trend_path
-from salestrend.query.planner import Plan, Segment
+from salestrend.query.planner import Plan, Segment, local_day_utc
 from salestrend.store import Store
 
 
@@ -74,8 +75,8 @@ def test_latency_histogram_by_path():
 def test_trend_path_labels():
     assert trend_path({"cache": "hit", "plan": [{"segment": "fact"}]}) == "cache_hit"
     assert trend_path({"cache": "stale", "plan": []}) == "stale"
-    assert trend_path({"cache": "miss", "plan": [{"segment": "hourly"}, {"segment": "hourly"}]}) == "hourly"
-    assert trend_path({"cache": "miss", "plan": [{"segment": "hourly"}, {"segment": "fact"}]}) == "mixed"
+    assert trend_path({"cache": "miss", "plan": [{"segment": "class_15m"}, {"segment": "class_15m"}]}) == "class_15m"
+    assert trend_path({"cache": "miss", "plan": [{"segment": "class_15m"}, {"segment": "fact"}]}) == "mixed"
     assert trend_path({"cache": "miss", "plan": []}) == "empty"
 
 
@@ -86,9 +87,10 @@ def test_storage_queries_counted_per_segment():
 
     store = Store(None, client=Client())  # 注入假 client，不连库
     plan = Plan(days=[date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)],
-                segments=[Segment("class_daily", [date(2024, 1, 1)]), Segment("hourly", [date(2024, 1, 2)]),
-                          Segment("fact", [date(2024, 1, 3)])])
-    before = {s: val("storage_queries_total", segment=s) for s in ("class_daily", "hourly", "fact")}
+                segments=[Segment(k, [d], *local_day_utc(d, ZoneInfo("UTC"))) for k, d in
+                          (("class_daily", date(2024, 1, 1)), ("class_15m", date(2024, 1, 2)),
+                           ("fact", date(2024, 1, 3)))])
+    before = {s: val("storage_queries_total", segment=s) for s in ("class_daily", "class_15m", "fact")}
     store.run_plan(plan, "maxi-dress", "v1", "UTC", ["app"])
     assert all(val("storage_queries_total", segment=s) - before[s] == 1 for s in before)
 

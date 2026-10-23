@@ -6,13 +6,14 @@ flowchart LR
     Q --> D[去重<br/>批内 + 跨批窗口键集]
   end
   D -->|全部行，含重复与拒收标记| RAW[(raw_sales_events<br/>只追加，审计)]
-  D -->|干净行| FACT[(fact_sales<br/>按月分区)]
+  D -->|干净行| FACT[(fact_sales<br/>按月分区 · event_ts 打头)]
   RAW --> DIMP[(dim_product<br/>以 id 为锚汇总标题写法)]
   DIMP --> CLS[规则引擎<br/>rules/*.yaml · 多版本并存]
   CLS --> MEM[(product_class_member)]
   FACT --> RU[汇总重算<br/>先删后写 · 幂等]
   MEM --> RU
-  RU --> H[(agg_product_hourly<br/>商品 × 平台 × UTC 小时)]
+  RU --> H[(agg_product_15m<br/>商品 × 平台 × UTC 15 分钟<br/>重算中间层，不在查询路径上)]
+  H --> CHR[(agg_class_15m<br/>品类 × 版本 × 平台 × UTC 15 分钟)]
   RU --> DC[(agg_class_daily<br/>品类 × 版本 × 预设时区 × 本地日)]
   RU --> ST[(pipeline_state<br/>sealed_until / data_through)]
 
@@ -21,8 +22,8 @@ flowchart LR
     API --> C{Redis<br/>分档 TTL · stale 副本}
     C -->|未命中 · singleflight| QP[查询规划器]
     QP -->|A 预设时区 · 已封口| DC
-    QP -->|B 整点时区 · 已封口| H
-    QP -->|C 未封口 · 非整点时区| FACT
+    QP -->|B 其余已封口部分 · 含当天封口线之前| CHR
+    QP -->|C 封口线之后的尾巴| FACT
     QP -.品类成员.-> MEM
     QP -.水位.-> ST
   end

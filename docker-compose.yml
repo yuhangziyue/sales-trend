@@ -6,7 +6,7 @@ services:
       CLICKHOUSE_USER: ${CH_USER:-salestrend}
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-salestrend}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-    ports: ["8123:8123"]
+    ports: ["${CH_HOST_PORT:-8123}:8123"]   # 宿主机端口可用环境变量覆盖
     ulimits:
       nofile: {soft: 262144, hard: 262144}
     healthcheck:
@@ -17,7 +17,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -33,7 +33,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       RATE_LIMIT_PER_S: ${RATE_LIMIT_PER_S:-50}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-100}
-    ports: ["8000:8000"]
+      API_WORKERS: ${API_WORKERS:-2}
+    ports: ["${API_HOST_PORT:-8000}:8000"]
     depends_on:
       clickhouse: {condition: service_healthy}
       redis: {condition: service_healthy}

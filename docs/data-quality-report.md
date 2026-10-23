@@ -1,6 +1,6 @@
 # 数据质量报告
 
-> 由 `make report` 自动生成 · 数据源 `sample-sales-data.xlsx` · 生成于 2026-10-21 06:49 UTC
+> 由 `make report` 自动生成 · 数据源 `sample-sales-data.xlsx` · 生成于 2026-10-22 13:07 UTC
 
 ## 1 · 总览
 
@@ -92,6 +92,28 @@
 | 2018 | T-shirt Dress | shirt | exclude | R0_default | C1_category_conflict | 54 |
 | 2027 | Maxi Skirt | skirt | exclude | R2_other_garment | — | 98 |
 
+## 5.3 · 品类判定 `maxi-dress` 规则 v3（影子版本）
+
+命中 12 个商品，合计 1117 件。下表只列命中、待审、告警，以及标题含 maxi 但被排除的商品。
+
+| product_id | 标题写法 | 原始类目 | 判定 | 命中规则 | 告警 | 去重后销量 |
+|---|---|---|---|---|---|---|
+| 2001 | Maxi Dress Floral / maxi dress floral | dress | match | S1_strong | — | 118 |
+| 2002 | SUMMER MAXI DRESS / Summer Maxi Dress | dress | match | S1_strong | — | 94 |
+| 2003 | Red Maxi Dress / Red Maxi-Dress | dress | match | S1_strong | — | 108 |
+| 2004 | Blue Maxi Dress / blue maxi  dress | dress | match | S1_strong | — | 90 |
+| 2005 | Floral Maxi Dress / Floral long maxi dress | dress | match | S1_strong | — | 106 |
+| 2006 | Black Maxi Dress | dress | match | S1_strong | — | 56 |
+| 2007 | Formal Maxi Dress | dress | match | S1_strong | — | 89 |
+| 2008 | Denim Maxi Dress / Maxi Denim Dress | dress | match | S1_strong | — | 126 |
+| 2009 | Long Maxi Summer Dress | dress | match | S1_strong | — | 83 |
+| 2010 | Women's Maxi-Dress Floral / Womens Maxi Dress Floral | dress | match | S1_strong | — | 105 |
+| 2011 | MAXI DRESS WHITE | dress | match | S1_strong | — | 96 |
+| 2012 | Maxi Floral Evening Dress | dress | match | S1_strong | — | 46 |
+| 2017 | Elegant Long Dress | dress | review | S3_weak_only | — | 100 |
+| 2018 | T-shirt Dress | shirt | exclude | S0_no_length | C1_category_conflict | 54 |
+| 2027 | Maxi Skirt | skirt | exclude | H1_head_other_garment | — | 98 |
+
 ## 6 · 日界敏感行（换时区会换日）
 
 | 行号 | user_id | 原始时间 | 按 UTC 归属 | 按 Asia/Shanghai 归属 | product_id | sales |
@@ -116,11 +138,11 @@
 
 ## 8 · 各平台数据截止时间
 
-| 平台 | 源时区 | 最新事件（UTC） | 行数 |
-|---|---|---|---|
-| app | UTC | 2024-03-13 09:45 | 97 |
-| marketplace | UTC | 2024-03-11 15:15 | 95 |
-| website | UTC | 2024-03-12 18:05 | 96 |
+| 平台 | 源时区 | 已与采集方确认 | 最新事件（UTC） | 行数 |
+|---|---|---|---|---|
+| app | UTC | **否**（假设） | 2024-03-13 09:45 | 97 |
+| marketplace | UTC | **否**（假设） | 2024-03-11 15:15 | 95 |
+| website | UTC | **否**（假设） | 2024-03-12 18:05 | 96 |
 
 数据只到 2024-03-13：之后的日期 API 返回 `null`（还没数据），与 `0`（没卖出去）区分。
 
@@ -128,4 +150,8 @@
 
 ## 9 · 时区假设
 
-timestamp 不带时区。本数据三个平台默认都按 UTC 解析（`config/platforms.yaml`）。但小时分布集中在 07–22 点，更像本地营业时间：**生产环境必须与采集方确认**。改配置后重放 ingest 即可，raw 表保留了原始时间文本。
+timestamp 不带时区，源时区按平台登记在 `config/platforms.yaml`（`source_tz` + `confirmed`）。
+
+未确认的平台：`app`、`marketplace`、`website`（共 3/3 个）。当前 source_tz 是我们的假设：小时分布集中在 07–22 点，更像本地营业时间，**生产环境必须与采集方确认**。查询时只要请求 tz 与未确认的 source_tz 不同，响应 meta.warnings 会带 `SOURCE_TZ_UNCONFIRMED`。
+
+确认后改配置（`confirmed: true`）并重放 ingest 即可，raw 表保留了原始时间文本 ts_raw。

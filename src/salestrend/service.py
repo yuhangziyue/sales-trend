@@ -166,12 +166,14 @@ class TrendService:
         labels = [max(b, p.start) for b in buckets]  # 首个周/月桶从 start_date 起算
 
         def roll(vals: dict[date, int | None]) -> list[int | None]:
-            out = []
-            for b in buckets:
-                xs = [v for d, v in vals.items() if _bucket(d, p.granularity) == b]
-                known = [x for x in xs if x is not None]
-                out.append(sum(known) if known else None)
-            return out
+            # 一趟累加：原来每个桶各扫一遍全部日子，一年 day 粒度是 366 × 366 × 平台数次比较，
+            # 单请求 13 ms 纯 CPU，在 50–100 ms 的端到端预算里占得太多。桶内全为 null 时仍返回 null
+            acc: dict[date, int] = {}
+            for d, v in vals.items():
+                if v is not None:
+                    b = _bucket(d, p.granularity)
+                    acc[b] = acc.get(b, 0) + v
+            return [acc.get(b) for b in buckets]
 
         series = [{"platform": src, "values": roll(daily[src])} for src in p.platforms]
         total = [None if all(s["values"][i] is None for s in series)

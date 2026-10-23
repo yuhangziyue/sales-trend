@@ -48,12 +48,22 @@ function rangeUrl() {
          `&platforms=${pick(PLATFORM_SETS)}&granularity=${g}`;
 }
 
-// 起止各抖动 0–14 天（仍约一年、仍全是小时表段）：让并发请求落在不同 key 上，singleflight 合并不了，
-// 每个请求都真打存储
+// P5 端到端，四个场景（-e P5=...），都让并发请求落在不同 key 上：singleflight 合并不了，每个请求都真打存储
+//   agg_hourly / agg_kathmandu / agg_daily  一年区间，起止各抖动 0–14 天：Berlin、Kathmandu 走品类 15 分钟表段，
+//                           UTC 走日表段（agg_hourly 沿用旧名，便于和优化前对照）
+//   rt_utc / rt_berlin / rt_kathmandu  近 30 天：终点固定在 12-31（p5.py 把这天设成未封口，走明细段），
+//                           起点抖动 0–6 天 × 7 种平台组合
+// 默认规则版本 v1：p5 库的成员表就建在 v1 下
+const P5_MODE = __ENV.P5 || 'agg_hourly';
 function p5Url() {
+  if (P5_MODE.startsWith('rt_')) {
+    const tz = { rt_utc: 'UTC', rt_berlin: 'Europe/Berlin', rt_kathmandu: 'Asia/Kathmandu' }[P5_MODE];
+    return `${T}?start_date=${day(335 + Math.floor(Math.random() * 7))}&end_date=2024-12-31&tz=${tz}` +
+           `&platforms=${pick(PLATFORM_SETS)}`;
+  }
   const a = Math.floor(Math.random() * 15), b = Math.floor(Math.random() * 15);
-  return `/v1/product-classes/maxi-dress/sales-trend?start_date=${day(a)}&end_date=${day(365 - b)}` +
-         `&tz=Europe/Berlin`;   // 默认规则版本 v1：p5 库里把同一份成员复制到了 v1 下
+  const tz = { agg_daily: 'UTC', agg_hourly: 'Europe/Berlin', agg_kathmandu: 'Asia/Kathmandu' }[P5_MODE];
+  return `${T}?start_date=${day(a)}&end_date=${day(365 - b)}&tz=${tz}`;
 }
 
 // 按 X-Cache 响应头分类计数与计时，和 /metrics 的 trend_requests_total 交叉验证
@@ -66,6 +76,12 @@ const SCENARIOS = {
     scenarios: { hot: { executor: 'constant-arrival-rate', rate: 1000, timeUnit: '1s', duration: '60s',
                         preAllocatedVUs: 200, maxVUs: 1000 } },
     thresholds: { http_req_duration: ['p(99)<50'], http_req_failed: ['rate<0.001'] },
+  },
+  hit: {
+    // 容量：缓存命中路径的拐点。与 hot 同一组 20 个热点 key，到达率由 RATE 给，perf/capacity.py 逐档加压
+    scenarios: { hit: { executor: 'constant-arrival-rate', rate: Number(__ENV.RATE || 1000), timeUnit: '1s',
+                        duration: __ENV.DURATION || '30s', preAllocatedVUs: 200, maxVUs: 3000 } },
+    thresholds: { http_req_duration: ['p(99)<20'], http_req_failed: ['rate<0.001'] },
   },
   cold: {
     scenarios: { cold: { executor: 'constant-arrival-rate', rate: 200, timeUnit: '1s', duration: '60s',
@@ -85,10 +101,11 @@ const SCENARIOS = {
     thresholds: { http_req_failed: ['rate<0.001'] },
   },
   p5: {
-    // P5 端到端：指向 p5 库的 API 实例，一年区间小时表段（Europe/Berlin 非预设整点时区），缓存旁路。RATE 可调
+    // P5 端到端：指向 p5 库的 API 实例，缓存旁路。RATE 可调。阈值即用户给的目标：已聚合 100 ms，实时 150 ms
     scenarios: { p5: { executor: 'constant-arrival-rate', rate: Number(__ENV.RATE || 10), timeUnit: '1s',
                        duration: __ENV.DURATION || '60s', preAllocatedVUs: 50, maxVUs: 300 } },
-    thresholds: { http_req_duration: ['p(99)<500'], http_req_failed: ['rate<0.001'] },
+    thresholds: { http_req_duration: [`p(99)<${P5_MODE.startsWith('rt_') ? 150 : 100}`],
+                  http_req_failed: ['rate<0.001'] },
   },
   herd: {
     // 同一个冷 key 瞬间 500 并发：验证 singleflight，存储层查询次数由 run.sh 从 system.query_log 取
@@ -100,7 +117,7 @@ const SCENARIOS = {
 export const options = { ...SCENARIOS[SCEN], summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'] };
 
 export default function () {
-  const url = SCEN === 'hot' || SCEN === 'hot200' ? pick(HOT)
+  const url = SCEN === 'hot' || SCEN === 'hot200' || SCEN === 'hit' ? pick(HOT)
     : SCEN === 'cold' ? mixedUrl()
     : SCEN === 'range' ? rangeUrl()
     : SCEN === 'p5' ? p5Url()
