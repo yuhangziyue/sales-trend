@@ -1,6 +1,6 @@
 # maxi dress 识别规则 v3：中心词 + 长度槽
 
-v3 是**影子版本**（`rules/maxi_dress.v3.yaml`，`default: false`）。默认版本仍是 v1。查询时加 `?rule_version=v3` 就能和 v1 对比，事实表和小时表不用重算。
+v3 是**影子版本**（`rules/maxi_dress.v3.yaml`，`default: false`）。默认版本仍是 v1。查询时加 `?rule_version=v3` 就能和 v1 对比：明细和商品 15 分钟层不用重算，只重算成员表和品类汇总表（品类 15 分钟表、品类日表）。
 
 ## 1. 为什么要 v3
 
