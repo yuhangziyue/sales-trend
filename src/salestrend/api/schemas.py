@@ -48,8 +48,10 @@ class TrendMeta(BaseModel):
     source_tz_assumed: bool = Field(description="选中平台里有源时区未与采集方确认的平台")
     warnings: list[SourceTzWarning] = Field(description="不影响结果返回的提示；没有时为空数组")
     sum: dict[str, int] = Field(description="区间合计，按平台与 all；null 按 0 计")
-    plan: list[dict] = Field(description="查询规划：每段读的表与日期范围")
-    cache: str = Field(description="hit | miss | stale")
+    plan: list[dict] = Field(description="真正查了 ClickHouse 的段：每段读的表、日期范围与 UTC 区间。"
+                                         "月块命中的部分不列；为回填整月块，段的日期范围可以超出请求区间")
+    cache: str = Field(description="hit = 整响应缓存命中 · block = 全部由月块拼出、没查库 · "
+                                   "block_partial = 部分来自月块、其余现查 · miss = 没用上缓存 · stale = 存储故障时的旧副本")
     stale: bool
     generated_at: str
 

@@ -7,7 +7,8 @@ API 是 uvicorn 多 worker：每个 worker 是独立进程，各数各的。所�
 
 没设这个变量时（单元测试、本地单进程）退回进程内默认注册表。
 
-命中率 = hit / (hit + miss + stale)；回源率 = storage_queries_total / trend_requests_total。公式与告警线见 design.md §7.2。
+命中率分三档：第一层 hit、月块全命中 block、部分命中 block_partial，分母都是 hit + block + block_partial + miss + stale；
+回源率 = storage_queries_total / trend_requests_total。公式与告警线见 design.md §7.2。
 """
 
 from __future__ import annotations
@@ -29,10 +30,12 @@ from prometheus_client import (
 LATENCY_BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
 
 TREND_REQUESTS = Counter(
-    "trend_requests_total", "趋势接口请求数。cache=hit|miss|stale；none = 没走到缓存（参数错、限流、404）",
+    "trend_requests_total", "趋势接口请求数。cache=hit|block|block_partial|miss|stale；"
+    "none = 没走到缓存（参数错、限流、404）",
     ["cache", "status"])
 TREND_SECONDS = Histogram(
-    "trend_request_seconds", "趋势接口耗时（成功响应）。path=cache_hit|stale|class_daily|class_15m|fact|mixed|empty",
+    "trend_request_seconds", "趋势接口耗时（成功响应）。"
+    "path=cache_hit|block|block_partial|stale|class_daily|class_15m|fact|mixed|empty",
     ["path"], buckets=LATENCY_BUCKETS)
 STORAGE_QUERIES = Counter("storage_queries_total", "实际执行的分段 SQL 数，每段一次", ["segment"])
 SINGLEFLIGHT_SHARED = Counter("singleflight_shared_total", "被 singleflight 合并、等别人结果的请求数")
@@ -45,8 +48,8 @@ def trend_path(meta: dict) -> str:
     """延迟按「这次请求实际读了什么」分桶：命中缓存、单段、或多段混合。"""
     if meta.get("cache") == "hit":
         return "cache_hit"
-    if meta.get("cache") == "stale":
-        return "stale"
+    if meta.get("cache") in ("stale", "block", "block_partial"):
+        return meta["cache"]  # 月块路径单独分桶：拼装的代价要能和第一层命中、直接查库分开看
     segs = {p["segment"] for p in meta.get("plan", [])}
     if not segs:
         return "empty"  # 区间全部晚于数据截止：不查库，直接返回 null

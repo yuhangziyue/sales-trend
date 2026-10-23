@@ -47,11 +47,15 @@ class ResponseCache:
         except Exception as e:  # noqa: BLE001
             log.warning("cache set failed: %s", e)
 
-    async def data_gen(self) -> str:
+    async def data_gen(self) -> str | None:
+        """读不到（Redis 故障）返回 None，调用方据此两层缓存都不读不写。
+
+        不能退回 "0"：旧代号 0 下可能还留着 7 天 TTL 的月块和 24 小时的整响应，读到就是回填前的旧数据。
+        """
         try:
             return (await self.r.get("data_gen") or b"0").decode()
         except Exception:  # noqa: BLE001
-            return "0"
+            return None
 
     async def bump_data_gen(self) -> None:
         try:
@@ -90,6 +94,47 @@ class SingleFlight:
             raise
         finally:
             del self._inflight[key]
+
+
+class KeyedFlight:
+    """按单个 key 合并的 singleflight，用于月块：一个请求要一批 key，只认领别人没在查的那些，其余等别人。
+
+    为什么按块的 key、而不是按「缺块集合」合并：任意区间下两个请求的缺块集合几乎从不相同（1 月 15–20 号与
+    1 月 3 号–2 月 9 号缺的块有交集、集合却不同），按集合合并在冷启动时等于没合并；按块合并，交集部分只查一次。
+    认领的 key 由本请求一次查完；不会死锁：查库时不等任何人，等别人只发生在自己查完之后。
+    """
+
+    def __init__(self) -> None:
+        self._inflight: dict[str, asyncio.Future] = {}
+        self.calls = 0  # 实际回源次数，测试观测用
+
+    async def do(self, keys: list[str], fetch: Callable[[list[str]], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+        theirs = {k: self._inflight[k] for k in keys if k in self._inflight}
+        mine = [k for k in keys if k not in theirs]
+        loop = asyncio.get_running_loop()
+        futs = {k: loop.create_future() for k in mine}
+        self._inflight.update(futs)
+        out: dict[str, Any] = {}
+        try:
+            if mine:
+                self.calls += 1
+                out = await fetch(mine)
+                for k in mine:
+                    futs[k].set_result(out.get(k))
+        except BaseException as e:
+            for f in futs.values():
+                if not f.done():
+                    f.set_exception(e)
+                    f.exception()  # 标记已取走，避免没人等时报 never retrieved
+            raise
+        finally:
+            for k in mine:
+                self._inflight.pop(k, None)
+        if theirs:
+            SINGLEFLIGHT_SHARED.inc()  # 本请求有块是等别人查回来的
+            for k, f in theirs.items():
+                out[k] = await asyncio.shield(f)
+        return out
 
 
 class TokenBucket:

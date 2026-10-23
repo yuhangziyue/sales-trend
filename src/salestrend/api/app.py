@@ -11,6 +11,7 @@ import uuid
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
+from ..cache.blocks import BlockCache
 from ..cache.resilience import ResponseCache, TokenBucket
 from ..classify.rules import default_versions, load_rulesets
 from ..metrics import TREND_REQUESTS, TREND_SECONDS, render, trend_path
@@ -24,7 +25,7 @@ log = logging.getLogger("salestrend")
 
 
 def create_app(settings: Settings | None = None, store=None, cache: ResponseCache | None = None,
-               use_redis: bool = True) -> FastAPI:
+               use_redis: bool = True, blocks: BlockCache | None = None) -> FastAPI:
     s = settings or get_settings()
     rulesets = load_rulesets(s.rules_dir)        # 品类列表进程内常驻：未知 slug 直接 404，不碰存储（防穿透）
     defaults = default_versions(rulesets)
@@ -34,12 +35,15 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
     app.add_exception_handler(Problem, problem_handler)
     if cache is None and use_redis:
         cache = ResponseCache(s.redis_url)
+        # 月块与整响应共用一个 Redis 连接池；BLOCK_CACHE=0 关掉第二层，用来复现只有整响应缓存时的对照
+        if blocks is None and s.block_cache:
+            blocks = BlockCache(cache.r)
     def store_factory():
         from ..store import Store  # 延迟导入并按需连接：ClickHouse 晚于 API 启动也能自愈
 
         return Store(s)
 
-    app.state.service = TrendService(s, store, cache, store_factory)
+    app.state.service = TrendService(s, store, cache, store_factory, blocks)
     bucket = TokenBucket(s.rate_per_s, s.rate_burst)
 
     @app.middleware("http")
@@ -109,7 +113,7 @@ def create_app(settings: Settings | None = None, store=None, cache: ResponseCach
             resp, meta = await _trend(request, class_slug, start_date, end_date, platforms, tz, granularity,
                                       rule_version)
         except Problem as e:
-            # 503 / 504 是缓存未命中后存储失败，算 miss（命中率分母要含它）；其余错误没走到缓存，记 none
+            # 503 / 504 是缓存未命中后存储失败（月块拼了一半也一样：没给出响应），算 miss（命中率分母要含它）；其余错误没走到缓存，记 none
             cache = "miss" if e.code in ("UPSTREAM_UNAVAILABLE", "QUERY_TIMEOUT") else "none"
             TREND_REQUESTS.labels(cache, str(e.status)).inc()
             raise

@@ -10,6 +10,7 @@ import platform
 import subprocess
 import sys
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 
 TARGETS = {
@@ -225,70 +226,106 @@ def hist_quantile(buckets: list[tuple[float, float]], q: float) -> float | None:
     return prev_le
 
 
+CACHE_KINDS = ("hit", "block", "block_partial", "miss", "stale")
+
+
+def _delta(before: dict, after: dict) -> dict:
+    return {key: v - before.get(key, 0.0) for key, v in after.items()}
+
+
+def _total(delta: dict, name: str, **want) -> float:
+    return sum(v for (n, lbl), v in delta.items() if n == name and all(dict(lbl).get(x) == y for x, y in want.items()))
+
+
+def _rates(delta: dict) -> dict:
+    """三档命中率与回源率，公式见 design.md §7.2。分母 = 走到缓存的请求（不含 none）。"""
+    cache = {c: _total(delta, "trend_requests_total", cache=c) for c in (*CACHE_KINDS, "none")}
+    served = sum(cache[c] for c in CACHE_KINDS)
+    storage = _total(delta, "storage_queries_total")
+    r = {"cache": cache, "served": served, "storage": storage}
+    for c in CACHE_KINDS:
+        r[f"{c}_rate"] = cache[c] / served if served else 0
+    r["any_rate"] = r["hit_rate"] + r["block_rate"]                  # 不查库就答上的
+    r["backsource"] = storage / served if served else 0
+    return r
+
+
 def p6_stats(results: Path, scen: str) -> dict | None:
     b, a, k = (results / f"{scen}_metrics_before.txt", results / f"{scen}_metrics_after.txt", results / f"{scen}.json")
     if not (b.exists() and a.exists() and k.exists()):
         return None
     before, after = snapshot(b), snapshot(a)
-    delta = {key: v - before.get(key, 0.0) for key, v in after.items()}
-
-    def total(name, **want):
-        return sum(v for (n, lbl), v in delta.items() if n == name and all(dict(lbl).get(x) == y for x, y in want.items()))
-
-    cache = {c: total("trend_requests_total", cache=c) for c in ("hit", "miss", "stale", "none")}
-    served = cache["hit"] + cache["miss"] + cache["stale"]
-    storage = total("storage_queries_total")
+    delta = _delta(before, after)
     paths = {}
     for (n, lbl), v in delta.items():
         if n == "trend_request_seconds_count" and v > 0:
             path = dict(lbl)["path"]
             bk = sorted((float(dict(l2)["le"]), c) for (n2, l2), c in delta.items()
                         if n2 == "trend_request_seconds_bucket" and dict(l2)["path"] == path)
-            paths[path] = {"n": int(v), "avg_ms": total("trend_request_seconds_sum", path=path) / v * 1000,
+            paths[path] = {"n": int(v), "avg_ms": _total(delta, "trend_request_seconds_sum", path=path) / v * 1000,
                            "p50_ms": (hist_quantile(bk, 0.5) or 0) * 1000, "p99_ms": (hist_quantile(bk, 0.99) or 0) * 1000}
+    # 冷启动曲线：run.sh 每 10 秒抓一次 /metrics，相邻快照相减就是这个窗口
+    snaps = [before, *[snapshot(f) for f in sorted(results.glob(f"{scen}_metrics_t*.txt"))]]
+    windows = [_rates(_delta(x, y)) for x, y in pairwise(snaps)]
     m = json.loads(k.read_text())["metrics"]
-    xc = {c: m.get(f"xcache_{c}", {}).get("count", 0) for c in ("hit", "miss", "stale")}
-    return {"cache": cache, "served": served, "hit_rate": cache["hit"] / served if served else 0,
-            "storage": storage, "storage_by_seg": {s: total("storage_queries_total", segment=s)
-                                                   for s in ("class_daily", "hourly", "class_15m", "fact")},
-            "backsource": storage / served if served else 0, "shared": total("singleflight_shared_total"),
-            "paths": paths, "k6_reqs": m["http_reqs"]["count"], "k6_xc": xc,
+    xc = {c: m.get(f"xcache_{c}", {}).get("count", 0) for c in CACHE_KINDS}
+    return {**_rates(delta), "storage_by_seg": {s: _total(delta, "storage_queries_total", segment=s)
+                                                for s in ("class_daily", "class_15m", "fact")},
+            "shared": _total(delta, "singleflight_shared_total"), "paths": paths, "windows": windows,
+            "k6_reqs": m["http_reqs"]["count"], "k6_xc": xc,
             "k6_dur": m["http_req_duration"], "k6_failed": m["http_req_failed"]["value"]}
 
 
 def p6_section(results: Path) -> list[str]:
-    stats = {s: p6_stats(results, s) for s in ("range", "hot200")}
+    names = {"range": "P6 任意区间 · 两层（整响应 + 月块）",
+             "range_noblock": "P6 任意区间 · 只有整响应缓存（BLOCK_CACHE=0，同机同轮对照）",
+             "hot200": "对照 · 20 个热点 key（P1 的 key 集） · 两层"}
+    stats = {s: p6_stats(results, s) for s in names}
     if not any(stats.values()):
         return ["## P6 任意区间命中率", "", "未运行（`make perf-p6`）。", ""]
-    names = {"range": "P6 任意区间", "hot200": "对照 · 20 个热点 key（P1 的 key 集）"}
     lines = ["## P6 任意区间命中率", "",
-             "两组都是固定到达率 200 RPS × 120s、开始前清空 trend 缓存。P6 每个请求随机取：起止日期都落在样例数据范围"
-             "（2024-01-01..03-13，73 天）内、长度 1–73 天均匀（题设 1–90 天，但数据只有 73 天）；平台 7 种非空组合；"
-             "tz 6 个预设时区；粒度 day 80% · week 10% · month 10%。对照组只打 P1 的 20 个热点 key。"
+             "每组都是固定到达率 200 RPS × 120s、开始前清空两层缓存（`trend:*` 与 `blk:*`）。P6 每个请求随机取："
+             "起止日期都落在样例数据范围（2024-01-01..03-13，73 天）内、长度 1–73 天均匀（题设 1–90 天，但数据只有 73 天）；"
+             "平台 7 种非空组合；tz 6 个预设时区；粒度 day 80% · week 10% · month 10%。对照组只打 P1 的 20 个热点 key。"
              "命中率与回源率取压测前后两次 `/metrics` 快照的差值（两个 worker 已由多进程模式汇总），"
-             "再用 k6 按 `X-Cache` 响应头计数交叉验证。", "",
-             "| 场景 | 请求数（/metrics · k6） | hit / miss / stale | 命中率 | k6 X-Cache 命中率 | 存储查询数 | 回源率 | "
-             "singleflight 合并 | 端到端 P50 / P95 / P99 ms | 失败率 |", "|" + "---|" * 10]
+             "再用 k6 按 `X-Cache` 响应头计数交叉验证。三档命中率的公式见 design.md §7.2："
+             "第一层 = hit；月块全命中 = block（不查库）；部分命中 = block_partial（用上了月块，但缺块或未封口的日查了库）；"
+             "分母都是 hit + block + block_partial + miss + stale。", "",
+             "| 场景 | 请求数（/metrics · k6） | hit / block / block_partial / miss / stale | 第一层 | 月块全命中 | 部分命中 | "
+             "不查库合计 | k6 X-Cache 不查库 | 存储查询数 | 回源率 | singleflight 合并 | 端到端 P50 / P95 / P99 ms | 失败率 |",
+             "|" + "---|" * 13]
     for s, st in stats.items():
         if not st:
-            lines.append(f"| {names[s]} | 未运行 |" + " |" * 8)
             continue
         xc = st["k6_xc"]
-        k6_hit = xc["hit"] / max(1, sum(xc.values()))
-        d = st["k6_dur"]
+        k6_any = (xc["hit"] + xc["block"]) / max(1, sum(xc.values()))
+        d, c = st["k6_dur"], st["cache"]
         lines.append(
-            f"| {names[s]} | {st['served']:.0f} · {st['k6_reqs']} | {st['cache']['hit']:.0f} / {st['cache']['miss']:.0f} / "
-            f"{st['cache']['stale']:.0f} | **{st['hit_rate'] * 100:.1f}%** | {k6_hit * 100:.1f}% | {st['storage']:.0f} | "
-            f"{st['backsource']:.3f} | {st['shared']:.0f} | {d['med']:.1f} / {d['p(95)']:.1f} / {d['p(99)']:.1f} | "
-            f"{st['k6_failed'] * 100:.2f}% |")
+            f"| {names[s]} | {st['served']:.0f} · {st['k6_reqs']} | "
+            f"{' / '.join(f'{c[x]:.0f}' for x in CACHE_KINDS)} | {st['hit_rate'] * 100:.1f}% | "
+            f"{st['block_rate'] * 100:.1f}% | {st['block_partial_rate'] * 100:.1f}% | **{st['any_rate'] * 100:.1f}%** | "
+            f"{k6_any * 100:.1f}% | {st['storage']:.0f} | **{st['backsource']:.3f}** | {st['shared']:.0f} | "
+            f"{d['med']:.1f} / {d['p(95)']:.1f} / {d['p(99)']:.1f} | {st['k6_failed'] * 100:.2f}% |")
     lines += ["", "按 path 的服务端延迟（`trend_request_seconds` 直方图差值；P50 / P99 为桶内插值，精度受桶宽限制）：", "",
               "| 场景 | path | 请求数 | 平均 ms | P50 ms | P99 ms |", "|---|---|---|---|---|---|"]
     for s, st in stats.items():
         for path, v in sorted((st or {}).get("paths", {}).items(), key=lambda x: -x[1]["n"]):
             lines.append(f"| {names[s]} | {path} | {v['n']} | {v['avg_ms']:.1f} | {v['p50_ms']:.1f} | {v['p99_ms']:.1f} |")
+    for s in ("range", "range_noblock"):
+        st = stats.get(s)
+        if st:
+            lines += ["", f"{names[s]} 存储查询按段：" +
+                      " · ".join(f"{k} {v:.0f}" for k, v in st["storage_by_seg"].items()) + "。"]
     st = stats.get("range")
-    if st:
-        lines += ["", "P6 存储查询按段：" + " · ".join(f"{k} {v:.0f}" for k, v in st["storage_by_seg"].items()) + "。"]
+    if st and st["windows"]:
+        lines += ["", "### 冷启动：命中率随时间爬升（P6 任意区间 · 两层）", "",
+                  "口径：压测期间每 10 秒抓一次 `/metrics`，相邻两次快照的差值即一个窗口（窗口边界与 k6 起点有约 1 秒的错位，"
+                  "首个窗口含 k6 启动）；不预热，从两层全空开始。", "",
+                  "| 窗口 | 请求数 | 第一层 | 月块全命中 | 部分命中 | 不查库合计 | 回源率 |", "|---|---|---|---|---|---|---|"]
+        for i, w in enumerate(st["windows"]):
+            lines.append(f"| {i * 10}–{i * 10 + 10} s | {w['served']:.0f} | {w['hit_rate'] * 100:.1f}% | "
+                         f"{w['block_rate'] * 100:.1f}% | {w['block_partial_rate'] * 100:.1f}% | "
+                         f"{w['any_rate'] * 100:.1f}% | {w['backsource']:.3f} |")
     return [*lines, ""]
 
 

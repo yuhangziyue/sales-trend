@@ -66,10 +66,11 @@ function p5Url() {
   return `${T}?start_date=${day(a)}&end_date=${day(365 - b)}&tz=${tz}`;
 }
 
-// 按 X-Cache 响应头分类计数与计时，和 /metrics 的 trend_requests_total 交叉验证
-const XC = { hit: new Counter('xcache_hit'), miss: new Counter('xcache_miss'), stale: new Counter('xcache_stale') };
-const XC_LAT = { hit: new Trend('xcache_hit_ms', true), miss: new Trend('xcache_miss_ms', true),
-                 stale: new Trend('xcache_stale_ms', true) };
+// 按 X-Cache 响应头分类计数与计时，和 /metrics 的 trend_requests_total 交叉验证。
+// block / block_partial 是第二层月块：全部由月块拼出 / 部分来自月块、其余现查
+const XC_KINDS = ['hit', 'block', 'block_partial', 'miss', 'stale'];
+const XC = Object.fromEntries(XC_KINDS.map((k) => [k, new Counter(`xcache_${k}`)]));
+const XC_LAT = Object.fromEntries(XC_KINDS.map((k) => [k, new Trend(`xcache_${k}_ms`, true)]));
 
 const SCENARIOS = {
   hot: {
@@ -90,7 +91,7 @@ const SCENARIOS = {
   },
   range: {
     // P6：固定到达率 200 RPS × 120s，缓存预先清空，任意区间。不设延迟阈值：这一场要的是命中率
-    scenarios: { range: { executor: 'constant-arrival-rate', rate: 200, timeUnit: '1s', duration: '120s',
+    scenarios: { range: { executor: 'constant-arrival-rate', rate: 200, timeUnit: '1s', duration: __ENV.DURATION || '120s',
                           preAllocatedVUs: 100, maxVUs: 500 } },
     thresholds: { http_req_failed: ['rate<0.001'] },
   },

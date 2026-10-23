@@ -34,7 +34,7 @@ make demo    # 10 条典型请求与真实响应
 | `make ingest` | 把同一文件再导一次，演示跨批去重：fact 行数不变 |
 | `make perf` | k6 固定到达率压测（P1–P4、P6），生成[压测报告](docs/perf-report.md)（需要本机装 k6） |
 | `make perf-p5` | 千万级实测：独立库 `p5` 合成 1000 万行明细，测存储、重算、三段查询与端到端，测完删库（`KEEP=1` 保留） |
-| `make perf-p6` | 只跑 P6：任意区间命中率，附 20 个热点 key 的对照 |
+| `make perf-p6` | 只跑 P6：任意区间命中率（两层缓存分三档统计，附每 10 秒一个窗口的冷启动曲线），附 20 个热点 key 的对照；`BLOCK_CACHE=0 P6_SCENS=range P6_SUFFIX=_noblock make perf-p6` 跑只有整响应一层的对照 |
 | `make capacity` | 容量：缓存命中路径逐档加压找单机拐点，对照 2 / 4 个 API worker（`API_WORKERS`） |
 | `make down` | 清理容器与数据 |
 
@@ -66,7 +66,8 @@ make demo    # 10 条典型请求与真实响应
 | 端到端 · 含当天实时（目标 150 ms） | 近 30 天：UTC、Berlin 300 RPS 下 P99 106 / 56 ms ✅（优化前拐点 200 RPS）；Kathmandu 200 RPS ✅、300 RPS 157 ms ❌ |
 | 缓存命中（目标 20 ms） | 1,500 RPS 下 P99 ≤ 12 ms ✅，2 / 4 个 worker 无差别；更高档位压测机的端口转发先撑不住 |
 | 万级推算 | 1 万 QPS、命中率 90%：4 台 4 vCPU API + 2 台 4 vCPU ClickHouse；命中率 11%：12 + 12 台（[design.md §7.4](docs/design.md)） |
-| 缓存命中率 | 20 个热点 key 99.8%；任意区间（P6）只有 11.2% |
+| 缓存命中率（P6 任意区间，200 RPS × 120 s，从空缓存开始） | 只有整响应一层时 11.2%、回源率 0.947；加月块后第一层 11.1% + 月块全命中 85.8% + 部分命中 3.0%，**不查库 96.9%、回源率 0.061**（剩下的回源几乎全是含当天的请求现查未封口的日）；20 个热点 key 99.8% |
+| 月块命中路径 | 100 个虚拟用户闭环：第一层命中 4,853 QPS / P99 43 ms；任意已封口区间 2,897 QPS / 月块响应 P99 74 ms，每请求 API CPU 约为第一层命中的 2 倍；Redis 每块约 200 B，一个品类一个版本 6 时区 3 平台一年 216 块 ≈ 45 KB |
 
 ## 架构
 
@@ -89,8 +90,9 @@ flowchart LR
   H --> CH[(agg_class_15m<br/>品类×版本×平台×UTC 15分钟)]
   RU --> DC[(agg_class_daily<br/>预设时区日表)]
   subgraph 读取
-    API[FastAPI] --> C{Redis}
-    C -->|未命中| QP[查询规划器]
+    API[FastAPI] --> C{Redis 第一层<br/>整个响应}
+    C -->|未命中| B{Redis 第二层<br/>月块：平台 × 本地月}
+    B -->|缺块 · 未封口的日| QP[查询规划器]
     QP -->|A 已封口 · 预设时区| DC
     QP -->|B 已封口 · 其余时区 · 当天封口线之前| CH
     QP -->|C 封口线之后的尾巴| FACT
@@ -102,6 +104,7 @@ flowchart LR
 1. **去重必须在聚合之前**。ClickHouse 的去重是最终一致的，物化视图会在插入时就把重复行聚合进去，事后撤不回来。所以去重在写入管线里做完，表引擎只做兜底。
 2. **汇总分两层物化，15 分钟粒度**。「商品 × 平台 × UTC 15 分钟」管灵活性：品类口径会变、商品销量不会变，改规则不重算它和明细，它只当重算中间层；「品类 × 规则版本 × 平台 × UTC 15 分钟」与预设时区的品类日表管热路径，每个规则版本一年约 7 万行。现行时区的偏移都是 15 分钟的整数倍，日界在查询时按任意时区切，+05:45 也不用扫明细。
 3. **查询规划器分三段读，一天之内也切**：封口线之前读汇总，只有封口线之后的尾巴读明细（明细按 event_ts 打头，尾巴只读几万行），并且把时区纳入分段条件。响应 `meta.plan` 回显每段读了哪张表与精确的 UTC 区间。
+4. **两层缓存**：第一层按整个响应，热点请求一次 GET；第一层未命中时从「品类 × 规则版本 × data_gen × 时区 × 单个平台 × 本地月」的月块拼出逐日值，只有缺块和未封口的日查 ClickHouse，再交给同一个 assemble 出周 / 月汇总，口径同源。月块只放已封口的日，靠 key 里的 data_gen 失效。`meta.cache` = hit / block / block_partial / miss / stale。拼装结果与直接计算的逐字段对拍是这一层的准入测试。
 
 完整说明（每个选型的「为什么 / 反方 / 何时换」）见 **[docs/design.md](docs/design.md)**。
 
@@ -204,12 +207,13 @@ src/salestrend/
 ├── classify/rules.py      标题归一化、规则引擎、多版本
 ├── query/planner.py       三段查询规划，按 UTC 半开区间切到一天之内（纯函数）
 ├── store.py               ClickHouse：建表、写入、汇总重算、三段查询
-├── service.py             缓存 → singleflight → 规划 → 执行 → 补零 → 降级
+├── service.py             整响应缓存 → singleflight → 规划 → 月块拼装 / 执行 → 补零 → 降级
 ├── api/                   FastAPI 路由、参数校验、RFC 9457 错误体
-├── cache/resilience.py    Redis 缓存、singleflight、令牌桶、熔断
+├── cache/resilience.py    Redis 整响应缓存、singleflight（按 key / 按块）、令牌桶、熔断
+├── cache/blocks.py        第二层月块：key、只放已封口日、失效校验、MGET / 写回
 └── report/quality.py      数据质量报告
-tests/unit                 归一化、规则、管线、规划器、11 个错误码、缓存与降级（假存储，不需要数据库）
-tests/integration          真 ClickHouse 黄金值、四条路径对拍（含 +05:45 / +08:45、v2 / v3、当天切开）、重算幂等
+tests/unit                 归一化、规则、管线、规划器、11 个错误码、缓存与降级、月块对拍（假存储，不需要数据库）
+tests/integration          真 ClickHouse 黄金值、四条路径对拍（含 +05:45 / +08:45、v2 / v3、当天切开）、月块对拍（真 Redis）、重算幂等
 ```
 
 ## 已知局限与下一步
@@ -219,6 +223,7 @@ tests/integration          真 ClickHouse 黄金值、四条路径对拍（含 +
 - **实时路径的拐点最低**（P5 实测，单机 4 vCPU）：UTC、Berlin 的已聚合请求 300 RPS 内 P99 ≤ 27 ms（Kathmandu 已聚合在 200 RPS 一档 115 ms，判断为单轮波动，照实记为不达标）；含当天的请求每次要多跑一段明细，UTC、Berlin 到 300 RPS 达标、Kathmandu 300 RPS 157 ms 略超 150 ms 目标。v1.2.0 的「小时表段不扛并发」已解决：根因是商品小时表全表扫描（FINAL 只在 part 未合并时放大代价，合并后可忽略），B 段已改读品类 15 分钟表。见[压测报告](docs/perf-report.md) P5 与 [design.md §2](docs/design.md)。
 - **单机压测有上限**：k6、API、ClickHouse 在同一台机器上；命中路径到 2,000 RPS 时 colima 的端口转发先垮了，所以命中路径只测到 1,500 RPS，不是服务拐点。万级推算基于单机实测的每请求 CPU，是量级而不是承诺。
 - **明细段的 31 天上限与单独限流**：v1.2.0 注释里写了但并未落实；改成 15 分钟粒度后明细只剩封口线之后的尾巴，这两条已不再需要（[design.md §5](docs/design.md)）。剩下的风险是重算停摆让尾巴变长，应监控 `now − sealed_until`。
-- **singleflight 与限流是进程内的**：多实例部署时，singleflight 锁与令牌桶应放到 Redis 或网关。
+- **singleflight 与限流是进程内的**：多实例部署时，singleflight 锁（整响应与月块两套）与令牌桶应放到 Redis 或网关。
+- **月块路径吃 API CPU**：任意区间下 86% 的请求由月块拼出，每个约是第一层命中的 2 倍 CPU（100 VU 实测 0.42 vs 0.21 ms·核）；ClickHouse 不再随区间随机程度增长，压力转到 API 上（[design.md §7.0、§7.4](docs/design.md)）。
 - **重算任务没有接调度器**：演示用 `make seed` 一次性重算；生产按「每 5 分钟最近 3 小时、每天最近 2 天」接 cron 或调度系统。
 - **没有鉴权**：只按 `X-API-Key` 头做限流分桶演示。

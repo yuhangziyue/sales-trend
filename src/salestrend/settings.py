@@ -28,6 +28,7 @@ class Settings:
     rate_per_s: float = float(os.getenv("RATE_LIMIT_PER_S", "50"))
     rate_burst: int = _env_int("RATE_LIMIT_BURST", 100)
     max_range_days: int = 366
+    block_cache: bool = os.getenv("BLOCK_CACHE", "1") != "0"  # 第二层月块缓存开关，默认开
     rules_dir: Path = ROOT / "rules"
     platforms: dict[str, str] = field(default_factory=dict)          # 平台 → 源时区
     source_tz_confirmed: dict[str, bool] = field(default_factory=dict)  # 平台 → 源时区是否已与采集方确认

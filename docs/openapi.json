@@ -558,12 +558,12 @@
             },
             "type": "array",
             "title": "Plan",
-            "description": "查询规划：每段读的表与日期范围"
+            "description": "真正查了 ClickHouse 的段：每段读的表、日期范围与 UTC 区间。月块命中的部分不列；为回填整月块，段的日期范围可以超出请求区间"
           },
           "cache": {
             "type": "string",
             "title": "Cache",
-            "description": "hit | miss | stale"
+            "description": "hit = 整响应缓存命中 · block = 全部由月块拼出、没查库 · block_partial = 部分来自月块、其余现查 · miss = 没用上缓存 · stale = 存储故障时的旧副本"
           },
           "stale": {
             "type": "boolean",
