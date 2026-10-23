@@ -21,6 +21,7 @@ v1.2.0 的 B 段读的就是商品层）、明细段 31 天（v1.2.0 下 Kathman
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -69,7 +70,10 @@ FROM numbers(5000)
 
 
 def ch(sql: str, db: str, comment: str = "", fmt: str = "TSV", stdin: str | None = None) -> str:
-    args = [*DC, "clickhouse-client", *AUTH, "--database", db, "--format", fmt]
+    # 灌数与重算的大 GROUP BY 显式限内存、超了落盘：ClickHouse 默认按整机内存的 90% 估上限，
+    # 和 API、Redis 混部在 6 GiB 虚拟机里时，没到它自己的上限就先被内核 OOM 杀掉（10-23 实测 exit 137）
+    args = [*DC, "clickhouse-client", *AUTH, "--database", db, "--format", fmt,
+            "--max_memory_usage", "2500000000", "--max_bytes_before_external_group_by", "1000000000"]
     if comment:
         args += ["--log_comment", comment]
     if stdin is not None:
@@ -308,7 +312,12 @@ def main() -> None:
         # 重算顺序与 store.rollup 相同：商品 15 分钟表 → 品类 15 分钟表（从商品层汇总）→ 品类日表（从明细）
         ver = int(time.time() * 1000)
         year = {"from": datetime(2024, 1, 1, tzinfo=UTC), "to": datetime(2025, 1, 1, tzinfo=UTC), "version": ver}
-        res["rollup_product"] = timed(db, f"p5-{run_id}-rollup-product", render("rollup/product_15m.sql", year))
+        # 商品 15 分钟层按月分批回填：全年一条 GROUP BY 要约 5.2 GiB，在 6 GiB 的 colima 虚拟机上稳定撞内存上限
+        # （code 241，10-23 连续两次）。生产大批量回填同理按分区分批，日常重算本来只算最近几个小时
+        months = [datetime(2024, m, 1, tzinfo=UTC) for m in range(1, 13)] + [year["to"]]
+        res["rollup_product"] = timed(db, f"p5-{run_id}-rollup-product", [
+            s for f, t in itertools.pairwise(months)
+            for s in render("rollup/product_15m.sql", {**year, "from": f, "to": t})])
         print("rollup product 15m", res["rollup_product"], flush=True)
         res["rollup_class_15m"] = timed(db, f"p5-{run_id}-rollup-class-15m", render(
             "rollup/class_15m.sql", {**year, "cls": CLS, "rv": RV}))
